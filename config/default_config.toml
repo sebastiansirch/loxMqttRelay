@@ -20,6 +20,11 @@ miniserver_pass = ""
 miniserver_max_parallel_connections = 5
 sync_with_miniserver = false
 use_websocket = true
+# HTTP forwarding: attempts (incl. the first) before a transient failure
+# (timeout, connection error, 5xx) is given up on, and the base delay in
+# seconds for the exponential backoff between attempts (0.5 -> 0.5s, 1s, 2s, ...).
+miniserver_http_retry_attempts = 3
+miniserver_http_retry_backoff_seconds = 0.5
 
 [topics]
 subscriptions = ["topic3"]

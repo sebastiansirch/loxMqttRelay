@@ -29,6 +29,11 @@ miniserver_pass = ""
 miniserver_max_parallel_connections = 20
 sync_with_miniserver = false
 use_websocket = false
+# Retries for transient HTTP failures (timeout, connection error, 5xx) towards
+# the Miniserver. Tune together with MOCK_DELAY_MS/MOCK_FAIL_RATE (see
+# loadtest/README.md) to see their effect on loss under a flaky/slow Miniserver.
+miniserver_http_retry_attempts = 3
+miniserver_http_retry_backoff_seconds = 0.5
 
 [topics]
 # Everything published under loadtest/cmd/# is forwarded to the (mock) Miniserver.

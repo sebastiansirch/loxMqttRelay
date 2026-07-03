@@ -44,6 +44,11 @@ class MiniserverConfig:
     miniserver_max_parallel_connections: int = 5
     sync_with_miniserver: bool = True
     use_websocket: bool = True
+    # HTTP forwarding: number of attempts (including the first) before a
+    # transient failure (timeout, connection error, 5xx) is given up on, and
+    # the base delay for the exponential backoff between attempts.
+    miniserver_http_retry_attempts: int = 3
+    miniserver_http_retry_backoff_seconds: float = 0.5
 
 @dataclass
 class TopicsConfig:

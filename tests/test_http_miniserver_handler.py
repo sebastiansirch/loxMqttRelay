@@ -2,7 +2,7 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
 from loxmqttrelay.http_miniserver_handler import HttpMiniserverHandler
-from loxmqttrelay.config import Config, AppConfig
+from loxmqttrelay.config import Config, AppConfig, global_config
 from loxmqttrelay.compatible._loxmqttrelay import MiniserverDataProcessor
 import aiohttp
 import asyncio
@@ -344,7 +344,81 @@ async def test_standard_ports_behavior(
         normalized_topic = test_topic.replace('/', '_')
         
         await handler.send_to_miniserver_via_http(test_topic, normalized_topic, test_value)
-        
+
         # The current implementation might not include standard ports
         # This test documents the current behavior
         mock_session.return_value.__aenter__.return_value.get.assert_called()
+
+
+# HTTP Retry Tests
+class _FakeResponse:
+    """A minimal real async context manager, unlike the shared `mock_session`
+    fixture's AsyncMock-based `.get` (which never actually enters the `async
+    with resp:` block - see test_http_session_reused_across_calls history).
+    Needed here because the retry logic branches on `resp.status`."""
+    def __init__(self, status: int):
+        self.status = status
+
+    async def __aenter__(self) -> "_FakeResponse":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        return None
+
+
+def _handler_with_fake_session(handler: HttpMiniserverHandler, get_side_effect) -> MagicMock:
+    fake_session = MagicMock()
+    fake_session.closed = False
+    fake_session.get = MagicMock(side_effect=get_side_effect)
+    handler._session = fake_session
+    return fake_session
+
+
+@pytest.mark.asyncio
+async def test_http_retries_transient_5xx_then_succeeds(handler: HttpMiniserverHandler) -> None:
+    """A transient 5xx should be retried and eventually succeed, without needing all attempts."""
+    fake_session = _handler_with_fake_session(handler, [_FakeResponse(503), _FakeResponse(200)])
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        result = await handler.send_to_miniserver_via_http("topic", "topic", "value")
+
+    assert fake_session.get.call_count == 2
+    assert result == {'code': 200}
+
+
+@pytest.mark.asyncio
+async def test_http_gives_up_after_max_retries(handler: HttpMiniserverHandler) -> None:
+    """Persistent 5xx failures are retried up to the configured limit, then given up on."""
+    max_attempts = global_config.miniserver.miniserver_http_retry_attempts
+    fake_session = _handler_with_fake_session(handler, lambda *a, **kw: _FakeResponse(503))
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        result = await handler.send_to_miniserver_via_http("topic", "topic", "value")
+
+    assert fake_session.get.call_count == max_attempts
+    assert result == {'code': 503}
+
+
+@pytest.mark.asyncio
+async def test_http_does_not_retry_4xx(handler: HttpMiniserverHandler) -> None:
+    """Client errors (4xx) are not transient and must not be retried."""
+    fake_session = _handler_with_fake_session(handler, lambda *a, **kw: _FakeResponse(404))
+
+    result = await handler.send_to_miniserver_via_http("topic", "topic", "value")
+
+    assert fake_session.get.call_count == 1
+    assert result == {'code': 404}
+
+
+@pytest.mark.asyncio
+async def test_http_retries_connection_errors(handler: HttpMiniserverHandler) -> None:
+    """A transient connection error should be retried and can still succeed."""
+    fake_session = _handler_with_fake_session(
+        handler, [aiohttp.ClientConnectionError("boom"), _FakeResponse(200)]
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        result = await handler.send_to_miniserver_via_http("topic", "topic", "value")
+
+    assert fake_session.get.call_count == 2
+    assert result == {'code': 200}

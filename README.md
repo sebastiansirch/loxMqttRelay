@@ -338,7 +338,20 @@ miniserver_user = ""
 miniserver_pass = ""
 miniserver_max_parallel_connections = 5
 use_websocket = false
+miniserver_http_retry_attempts = 3
+miniserver_http_retry_backoff_seconds = 0.5
 ```
+
+HTTP requests to the Miniserver keep a single, reused connection pool (instead of opening a new
+TCP connection per message) and retry transient failures - request timeouts, connection errors,
+and HTTP 5xx responses - with exponential backoff:
+
+- `miniserver_http_retry_attempts`: total number of attempts per message, including the first
+  (default `3`, i.e. up to 2 retries). Set to `1` to disable retrying.
+- `miniserver_http_retry_backoff_seconds`: base delay between attempts in seconds, doubled after
+  each retry (default `0.5` -> waits of 0.5s, 1s, 2s, ... between attempts).
+
+HTTP 4xx responses and unexpected errors are not retried, since retrying them would not help.
 
 ## Dynamic Configuration Updates
 

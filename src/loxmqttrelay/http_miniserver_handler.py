@@ -90,6 +90,13 @@ class HttpMiniserverHandler:
         Send data to Miniserver with rate limiting.
         If mock_ms_ip is provided and enable_mock_miniserver is True, mock server will be used instead of ms_ip.
         Returns a dictionary with results for each topic.
+
+        Transient failures (timeout, connection error, 5xx response) are
+        retried a few times with exponential backoff before giving up - a
+        real Miniserver can be briefly unreachable (reboot, momentary
+        overload) and a single failed attempt should not permanently drop
+        the message. Non-transient failures (4xx, unexpected exceptions) are
+        not retried.
         """
         # Use mock miniserver IP only if both provided and enabled
         logger.debug(f"Using miniserver address: {self.target_ip} {'(mock)' if (self.mock_ms_ip and self.enable_mock_miniserver) else '(real)'}")
@@ -101,35 +108,52 @@ class HttpMiniserverHandler:
         url = f"{self.http_base_url}/dev/sps/io/{normalized_topic}/{safe_value}"
         logger.debug(f"Sending to {url}")
 
-        try:
-            # Use semaphore to limit concurrent connections
-            async with self.connection_semaphore:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Miniserver returned {resp.status} for topic {topic} (URL: {url})")
-                    else:
-                        logger.debug(f"Sent {topic}={value} to Miniserver successfully.")
-                    return { 'code': resp.status }
-        except asyncio.TimeoutError:
-            error_msg = f" Error 408: Timeout while sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): request timed out after 10 seconds"
-            logger.error(error_msg)
-            return
-        except asyncio.CancelledError:
-            error_msg = f"Error 499: Request for {topic} (as {normalized_topic})={value} was cancelled (URL: {url})"
-            logger.error(error_msg)
-            return
-        except OSError as e:
-            error_msg = f"Error 503: Connection error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
-            logger.error(error_msg)
-            return
-        except aiohttp.ClientError as e:
-            error_msg = f"Error 500: Client error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
-            logger.error(error_msg)
-            return
-        except Exception as e:
-            error_msg = f"Error 500: Unexpected error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
-            logger.error(error_msg)
-            return
+        max_attempts = max(1, global_config.miniserver.miniserver_http_retry_attempts)
+        backoff_seconds = global_config.miniserver.miniserver_http_retry_backoff_seconds
+
+        for attempt in range(1, max_attempts + 1):
+            is_last_attempt = attempt == max_attempts
+            try:
+                # Use semaphore to limit concurrent connections
+                async with self.connection_semaphore:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            logger.debug(f"Sent {topic}={value} to Miniserver successfully.")
+                            return { 'code': resp.status }
+                        if resp.status < 500 or is_last_attempt:
+                            logger.warning(f"Miniserver returned {resp.status} for topic {topic} (URL: {url})")
+                            return { 'code': resp.status }
+                        logger.warning(
+                            f"Miniserver returned {resp.status} for topic {topic} (URL: {url}), "
+                            f"retrying ({attempt}/{max_attempts})"
+                        )
+            except asyncio.TimeoutError:
+                if is_last_attempt:
+                    logger.error(f" Error 408: Timeout while sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): request timed out after 10 seconds, giving up after {attempt} attempt(s)")
+                    return
+                logger.warning(f"Timeout sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}), retrying ({attempt}/{max_attempts})")
+            except asyncio.CancelledError:
+                error_msg = f"Error 499: Request for {topic} (as {normalized_topic})={value} was cancelled (URL: {url})"
+                logger.error(error_msg)
+                return
+            except OSError as e:
+                if is_last_attempt:
+                    logger.error(f"Error 503: Connection error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}, giving up after {attempt} attempt(s)")
+                    return
+                logger.warning(f"Connection error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}), retrying ({attempt}/{max_attempts}): {str(e)}")
+            except aiohttp.ClientError as e:
+                if is_last_attempt:
+                    logger.error(f"Error 500: Client error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}, giving up after {attempt} attempt(s)")
+                    return
+                logger.warning(f"Client error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}), retrying ({attempt}/{max_attempts}): {str(e)}")
+            except Exception as e:
+                error_msg = f"Error 500: Unexpected error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
+                logger.error(error_msg)
+                return
+
+            await asyncio.sleep(backoff_seconds * (2 ** (attempt - 1)))
+
+        return
     
     async def send_to_miniserver(
         self,
