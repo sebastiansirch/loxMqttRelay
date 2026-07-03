@@ -5,11 +5,13 @@ import pytest
 
 from loxwebsocket.encryption import LxEncryptionHandler
 from loxwebsocket.lox_ws_api import LoxWs
+from loxwebsocket.lxtoken import LxToken
 from loxmqttrelay.loxwebsocket_compat import (
     apply_patches,
     _close_stale_session_and_call,
     wrap_ws_send_str_with_shared_lock,
     log_if_normal_closure,
+    reset_token_if_not_already_reconnecting,
 )
 
 
@@ -289,3 +291,48 @@ def test_patch_normal_closure_logging_is_installed_and_idempotent():
 
     assert LoxWs.handle_connection_interrupt is patched_once
     assert getattr(LoxWs.handle_connection_interrupt, "_loxmqttrelay_patched", False) is True
+
+
+# --- reconnect() actually resets the token it reuses ---
+
+class _FakeSelfWithToken:
+    def __init__(self, state, token):
+        self.state = state
+        self._token = token
+
+
+def test_reset_token_if_not_already_reconnecting_resets_when_idle():
+    stale_token = LxToken(token="stale-token-value")
+    instance = _FakeSelfWithToken(state="CLOSED", token=stale_token)
+
+    did_reset = reset_token_if_not_already_reconnecting(instance, LxToken)
+
+    assert did_reset is True
+    assert instance._token is not stale_token
+    assert instance._token.token == ""
+
+
+def test_reset_token_if_not_already_reconnecting_skips_when_already_reconnecting():
+    """
+    Mirrors LoxWs.reconnect()'s own re-entrancy guard: if a reconnect is
+    already under way, a concurrent call must not clobber the token it may
+    still be relying on.
+    """
+    stale_token = LxToken(token="stale-token-value")
+    instance = _FakeSelfWithToken(state="RECONNECTING", token=stale_token)
+
+    did_reset = reset_token_if_not_already_reconnecting(instance, LxToken)
+
+    assert did_reset is False
+    assert instance._token is stale_token
+
+
+def test_patch_reconnect_resets_token_is_installed_and_idempotent():
+    apply_patches()
+    patched_once = LoxWs.reconnect
+
+    apply_patches()
+    apply_patches()
+
+    assert LoxWs.reconnect is patched_once
+    assert getattr(LoxWs.reconnect, "_loxmqttrelay_patched", False) is True

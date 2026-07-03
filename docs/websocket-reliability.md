@@ -248,6 +248,52 @@ into `case _: "Connection closed unexpectedly with unknown code: {code}"`, which
 mislabels a normal closure as "unexpected"/"unknown" in the log, obscuring exactly the distinction
 that matters when diagnosing this.
 
+### 9. `reconnect()` never actually resets the token it reuses (found from production logs)
+
+A follow-up production log showed the *same two lines*, verbatim except for the values, on every
+single reconnect attempt in a row (attempts 9 through 14+, spanning several minutes with zero
+successes):
+
+```
+ERROR [loxwebsocket.lox_ws_api] Error using existing token. Error hasing token. Unexpected content
+in Loxone response.. Trying to acquire new token...
+ERROR [loxwebsocket.lox_ws_api] Reconnection failed: Websocket closed while waiting for data.
+```
+
+That repetition - identical failure, every attempt, no variation - is the signature of a
+deterministic bug rather than a flaky network condition. `lox_ws_api.py`:
+
+```python
+def __init__(self, ...):
+    self._token = LxToken()          # <- read/written everywhere else via self._token
+
+async def reconnect(self) -> None:
+    if self.state == "RECONNECTING":
+        return
+    await self.stop()
+    self.token = LxToken()           # <- BUG: no underscore. A distinct, never-read attribute.
+    self.state = "RECONNECTING"
+    while ...
+```
+
+`refresh_token()` elsewhere in the same class does it correctly (`self._token = LxToken()`),
+confirming `reconnect()`'s `self.token = LxToken()` is a typo, not an intentional second attribute.
+The practical effect: `reconnect()`'s attempt to force a fresh token before retrying is a no-op.
+`self._token` - the one `async_init()`, `use_token()`, `hash_token()`, and `acquire_token()` all
+actually read - keeps holding whatever was valid *before* the disconnect. If that's since become
+invalid (e.g. the Miniserver rebooted and reset its sessions - itself often the very cause of the
+disconnect, see finding 7's "code 1000" discussion), every reconnect attempt:
+1. sees `self._token` looks "not yet expired" and tries `use_token()`,
+2. that fails ("Error hasing token: Unexpected content..."),
+3. falls back to `acquire_token()`, which needs its own round-trip - but the wasted round-trip
+   from step 1 has often given the Miniserver enough time to close the connection first, failing
+   the whole attempt,
+4. `self._token` is still never cleared, so the *next* attempt repeats this exact sequence.
+
+The result: a reconnect loop that can never actually succeed on its own, no matter how many times
+it retries or how long the underlying network/Miniserver issue that caused the original disconnect
+has since resolved itself - self-inflicted, independent of whatever caused the first disconnect.
+
 ## Fixes
 
 ### Response correlation + retry (`src/loxmqttrelay/websocket_ack.py`, new)
@@ -390,6 +436,33 @@ async def patched_handle_connection_interrupt(self, msg_type=None, exception=Non
     return await original_handle_connection_interrupt(self, msg_type=msg_type, exception=exception)
 ```
 
+### `loxwebsocket` reconnect token-reset patch (`src/loxmqttrelay/loxwebsocket_compat.py`)
+
+Fixes finding 9: performs the reset `reconnect()` only *thinks* it's doing, on the attribute
+that's actually read elsewhere:
+
+```python
+async def patched_reconnect(self):
+    reset_token_if_not_already_reconnecting(self, LxToken)
+    return await original_reconnect(self)
+
+def reset_token_if_not_already_reconnecting(instance, token_factory):
+    if instance.state == "RECONNECTING":
+        return False           # a reconnect is already in progress - don't disrupt it
+    instance._token = token_factory()
+    return True
+```
+
+Mirrors `reconnect()`'s own re-entrancy guard (`if self.state == "RECONNECTING": return`) so a
+concurrent call can't clobber the token an already-in-progress reconnect might still need. With
+`self._token` genuinely reset to an empty `LxToken()`, `async_init()`'s own check
+(`self._token.token == ""`) sends the very next attempt straight to `acquire_token()`, skipping the
+doomed `use_token()` round-trip that was consuming the time budget before the Miniserver closed the
+connection. This does not guarantee a subsequent attempt succeeds - an independent, ongoing
+network/Miniserver outage is unaffected by fixing a *client-side* bug - but it removes one
+concrete, deterministic, self-inflicted failure mode that previously made success impossible
+regardless of how long the retry loop ran.
+
 ### Per-topic sequencing, with coalescing (`src/loxmqttrelay/topic_sequencer.py`, new)
 
 `TopicSequencer` ensures at most one send is in flight per (normalized) topic at a time - for
@@ -494,8 +567,13 @@ this pass. Instead:
     last are ever sent.
   - `test_send_to_miniserver_without_coalescing_sends_every_value`: the same burst with
     `miniserver_coalesce_topic_updates = false` - asserts all three are sent, in order.
+- **3 more tests in `tests/test_loxwebsocket_compat.py`** for finding 9's fix, against
+  `reset_token_if_not_already_reconnecting()` directly with a fake instance and `LxToken`: resets
+  `_token` to a fresh, empty instance when idle, leaves an already-in-progress reconnect's token
+  alone (the re-entrancy-guard mirror), and confirms the patch installs on `LoxWs.reconnect`
+  idempotently.
 
-All 235 tests (198 existing + 37 new) pass, run inside the Docker build image (the project requires
+All 238 tests (198 existing + 40 new) pass, run inside the Docker build image (the project requires
 Python 3.14 + the compiled Rust extension, unavailable in this environment outside Docker). The
 timing-sensitive new tests were additionally run 5x in a row to check for flakiness - all passed
 every time.
@@ -539,13 +617,20 @@ every time.
      no actual synchronization - and isn't coordinated with concurrent command writes at all. An
      interleaved write can produce a malformed frame the Miniserver can't parse, which it may
      resolve by simply closing the connection.
+  8. (found via a second production log) `reconnect()` never actually resets the token it reuses:
+     it sets `self.token = LxToken()` (no underscore) before retrying, but every other place in the
+     class reads/writes `self._token`. The reset is a no-op, so every reconnect attempt keeps
+     retrying with whatever token was valid *before* the disconnect, fails identically every time if
+     that token has since become invalid, and can therefore never succeed on its own - confirmed by
+     a production log showing the exact same failure, verbatim, on every attempt over several
+     minutes.
 - Added response correlation + retry with exponential backoff (`websocket_ack.py`,
   `send_to_minisever_via_websocket()`), a write lock serializing the encrypt+send step, a fix for
   the reconnect race, narrow runtime patches for the `genarate_salt()` bug, the reconnect session
-  leak, and the unsynchronized heartbeat write (`loxwebsocket_compat.py`, isolated so they can be
-  dropped once fixed upstream), and a per-topic send sequencer (`topic_sequencer.py`) applied to
-  both HTTP and WebSocket, with an optional coalescing mode that drops superseded, not-yet-sent
-  values instead of queueing every one.
+  leak, the unsynchronized heartbeat write, and the token-reset no-op (`loxwebsocket_compat.py`,
+  isolated so they can be dropped once fixed upstream), and a per-topic send sequencer
+  (`topic_sequencer.py`) applied to both HTTP and WebSocket, with an optional coalescing mode that
+  drops superseded, not-yet-sent values instead of queueing every one.
 - New `[miniserver]` options: `miniserver_websocket_retry_attempts` (default `3`),
   `miniserver_websocket_retry_backoff_seconds` (default `0.5`),
   `miniserver_websocket_ack_timeout_seconds` (default `5.0`),
@@ -559,14 +644,15 @@ of real disconnects seen in production), a real chance of a corrupted session sa
 likely under higher message volume, no guarantee that rapid messages to the same topic (a
 double-tapped switch, a short automation, a dimmer slide) would even arrive in the right order, and
 - also seen in production - a resource leak that made a real Miniserver outage harder to recover
-from the longer it lasted.
+from the longer it lasted, plus a reconnect loop that, once it started failing with a stale token,
+could never recover at all without a manual restart.
 
 ### Changes
 - `src/loxmqttrelay/websocket_ack.py` (new): `WebSocketAckWaiter` - correlates outgoing commands
   with the Miniserver's response by topic.
 - `src/loxmqttrelay/loxwebsocket_compat.py` (new): runtime patches for the `genarate_salt()` bug,
-  the reconnect-loop `ClientSession` leak, unsynchronized heartbeat/command writes, and clearer
-  logging for close code 1000.
+  the reconnect-loop `ClientSession` leak, unsynchronized heartbeat/command writes, clearer logging
+  for close code 1000, and the token-reset no-op in `reconnect()`.
 - `src/loxmqttrelay/topic_sequencer.py` (new): `TopicSequencer` - per-topic send serialization with
   optional coalescing, applied to both HTTP and WebSocket at the `send_to_miniserver()` entry point.
 - `src/loxmqttrelay/http_miniserver_handler.py`: `send_to_minisever_via_websocket()` rewritten to
@@ -581,8 +667,12 @@ from the longer it lasted.
   ordering bug's exact repro scenario.
 
 ### Test Plan
-- [x] `pytest` (198 existing + 37 new tests, 235 total) passes, run inside the Docker build image;
+- [x] `pytest` (198 existing + 40 new tests, 238 total) passes, run inside the Docker build image;
       timing-sensitive new tests additionally run 5x in a row to check for flakiness.
+- [x] `test_reset_token_if_not_already_reconnecting_resets_when_idle` / `..._skips_when_already_reconnecting`
+      / `test_patch_reconnect_resets_token_is_installed_and_idempotent`: confirms the token-reset
+      fix actually clears `self._token` (not the unused `self.token`) before a fresh reconnect
+      attempt, leaves an in-progress reconnect's token alone, and installs idempotently.
 - [x] `test_close_stale_session_and_call_*` (4 tests) / `test_async_init_patch_is_installed_and_idempotent`:
       confirms the reconnect session-leak fix closes a stale open session before reconnecting,
       leaves an already-closed one alone, handles the very first connect, still proceeds if closing
@@ -638,6 +728,13 @@ from the longer it lasted.
   user from field experience with what code 1000 usually means for Loxone Miniservers; the fix
   closes a real synchronization gap regardless of whether it's the exact mechanism behind any one
   specific production disconnect.
+- Finding 9's fix (token reset) removes a *confirmed* deterministic bug - the identical failure
+  message repeating verbatim on every reconnect attempt in the production log is direct evidence,
+  not an inference from reading the source alone. It is not, however, a guarantee that reconnection
+  will always succeed afterward: if the original disconnect has an independent, ongoing cause (a
+  real network outage, the Miniserver being genuinely unreachable), fixing this client-side bug
+  only removes one specific way reconnection was guaranteed to keep failing - it doesn't make the
+  Miniserver reachable.
 - This branch is independent of `fix/miniserver-http-session-reuse-and-basetopic-warning` and
   `feature/defensive-whitelist-sync` - all three are based on `main` and can be reviewed/merged in
   any order.

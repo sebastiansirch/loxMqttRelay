@@ -24,6 +24,7 @@ def apply_patches() -> None:
     _patch_async_init_closes_stale_session()
     _patch_websocket_writes_are_serialized()
     _patch_normal_closure_logging()
+    _patch_reconnect_resets_token()
     _patches_applied = True
 
 
@@ -269,3 +270,73 @@ def log_if_normal_closure(close_code) -> None:
             "connection on purpose. Typically a Miniserver reboot/firmware update, or the "
             "Miniserver judging the heartbeat to have failed."
         )
+
+
+def _patch_reconnect_resets_token() -> None:
+    """
+    reconnect()'s intent is clearly to force a fresh token acquisition before
+    retrying - it does `self.token = LxToken()` right before the retry loop
+    starts. But every other place in the class (__init__, async_init(),
+    use_token(), hash_token(), acquire_token(), refresh_token()) reads or
+    writes `self._token` (with the underscore) - `self.token` is a distinct,
+    never-read attribute. reconnect()'s own reset is therefore a no-op:
+    self._token is never actually cleared, so every reconnect attempt keeps
+    trying to reuse whatever token was valid *before* the disconnect via
+    use_token(), even if the Miniserver has since invalidated it (e.g. after
+    its own reboot). That fails ("Error hasing token: Unexpected content..."),
+    falls back to acquire_token() - but the extra failed round-trip often
+    gives the Miniserver enough time to close the connection before
+    acquire_token() can finish, failing the whole attempt. Since self._token
+    is never cleared in between, this repeats identically, deterministically,
+    on every single reconnect attempt - the connection can never actually
+    come back up on its own.
+
+    This performs the reset reconnect() only *thinks* it's doing: sets
+    self._token (not self.token) to a fresh, empty LxToken() right before an
+    actual reconnect attempt starts, mirroring reconnect()'s own re-entrancy
+    guard (`if self.state == "RECONNECTING": return`) so an already-in-
+    progress reconnect isn't disrupted. With self._token empty,
+    async_init()'s own check (`self._token.token == ""`) takes it straight to
+    acquire_token() on the very next attempt, instead of first exhausting a
+    doomed use_token() call.
+
+    This does not guarantee reconnection succeeds - if the underlying outage
+    has some other, independent cause, this alone won't fix it - but it
+    removes one concrete, deterministic, self-inflicted failure mode.
+    """
+    try:
+        from loxwebsocket.lox_ws_api import LoxWs
+        from loxwebsocket.lxtoken import LxToken
+    except ImportError:
+        logger.warning(
+            "loxwebsocket.lox_ws_api.LoxWs/LxToken not importable - "
+            "skipping the reconnect-token-reset patch"
+        )
+        return
+
+    original_reconnect = LoxWs.reconnect
+
+    if getattr(original_reconnect, "_loxmqttrelay_patched", False):
+        return
+
+    async def patched_reconnect(self):
+        reset_token_if_not_already_reconnecting(self, LxToken)
+        return await original_reconnect(self)
+
+    patched_reconnect._loxmqttrelay_patched = True
+    LoxWs.reconnect = patched_reconnect
+    logger.info("Applied loxwebsocket compat patch: reconnect() resets the actually-used token")
+
+
+def reset_token_if_not_already_reconnecting(instance, token_factory) -> bool:
+    """
+    If a reconnect isn't already in progress (mirrors LoxWs.reconnect()'s own
+    re-entrancy guard), resets `instance._token` to a fresh instance via
+    `token_factory()`. Returns True if the reset happened. Split out from the
+    patch installer so it can be unit tested directly against a fake
+    instance, without needing a real LoxWs or any network I/O.
+    """
+    if instance.state == "RECONNECTING":
+        return False
+    instance._token = token_factory()
+    return True
