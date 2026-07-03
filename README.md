@@ -322,6 +322,42 @@ The websocket implementation provides:
 - Automatic handling of connection issues
 - Support for both encrypted and unencrypted connections
 
+Each command sent over the websocket is confirmed against the Miniserver's actual response
+(correlated by topic) and retried with exponential backoff on a timeout or a non-success response,
+instead of being sent and forgotten:
+
+```toml
+[miniserver]
+miniserver_websocket_retry_attempts = 3          # total attempts, incl. the first
+miniserver_websocket_retry_backoff_seconds = 0.5 # doubles after each retry
+miniserver_websocket_ack_timeout_seconds = 5.0   # how long to wait for a response per attempt
+```
+
+Set `miniserver_websocket_retry_attempts = 1` to disable retrying.
+
+#### Message Ordering Per Topic
+
+Nothing upstream of the Miniserver send (MQTT delivery, the internal dispatcher) guarantees that
+two rapid messages on the same topic are processed in order - and a retried, slow-to-complete send
+for an older value could otherwise land at the Miniserver after a newer value that already
+succeeded. To prevent that, sends for the same (normalized) topic are always serialized: at most
+one is in flight at a time, for both HTTP and WebSocket.
+
+If a newer value arrives for a topic while the previous one is still queued (not yet sent), it can
+either replace it or wait behind it:
+
+```toml
+[miniserver]
+miniserver_coalesce_topic_updates = true  # default
+```
+
+- `true` (default): the superseded value is dropped, only the latest one is sent once it's that
+  topic's turn. This matches Loxone virtual inputs' last-write-wins semantics and avoids spending a
+  full send-and-retry cycle on a value that's already stale by the time it would go out.
+- `false`: every value is sent, strictly in arrival order, one at a time per topic - nothing is
+  ever dropped, at the cost of added latency for that topic under a sustained burst (e.g. a slider
+  or dimmer sending many intermediate values quickly).
+
 #### UDP Communication
 ```toml
 [udp]

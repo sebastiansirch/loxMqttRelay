@@ -57,6 +57,24 @@ class MiniserverConfig:
     # publish (or whose publish is missed) no longer requires a relay restart
     # to pick up whitelist changes. 0 disables periodic sync (default).
     whitelist_sync_interval_seconds: int = 0
+    # WebSocket forwarding: send_websocket_command() alone does not wait for
+    # or check the Miniserver's response - these control how many attempts
+    # (incl. the first) we retry a command that times out or comes back with
+    # a non-200 Code, how long we wait for that response per attempt, and the
+    # base exponential backoff delay between attempts.
+    miniserver_websocket_retry_attempts: int = 3
+    miniserver_websocket_retry_backoff_seconds: float = 0.5
+    miniserver_websocket_ack_timeout_seconds: float = 5.0
+    # Sends for the same topic are always serialized (never more than one in
+    # flight at a time, HTTP or WebSocket) to prevent a retried older value
+    # from landing after a newer one that already succeeded. If a newer
+    # value arrives for a topic while the previous one is still queued (not
+    # yet sent), this decides whether to drop the superseded one (true,
+    # matches Loxone virtual inputs' last-write-wins semantics, avoids
+    # sending values that are already stale) or to still send every value in
+    # order (false, higher latency under a burst on one topic, no value ever
+    # dropped).
+    miniserver_coalesce_topic_updates: bool = True
 
 @dataclass
 class TopicsConfig:
