@@ -1,0 +1,49 @@
+[general]
+log_level = "WARNING"
+# IMPORTANT: base_topic must NOT be a prefix of any data topic in
+# [topics].subscriptions. The relay treats every incoming message whose topic
+# starts with base_topic as a *control* message (config/set, config/get, ...);
+# if it doesn't match one of those exact control topics it is silently
+# dropped (not forwarded, not logged). Keep the control namespace and the data
+# namespace disjoint, as the shipped default_config.toml does
+# (base_topic="test/" vs. subscriptions=["topic3"]).
+base_topic = "relaycontrol/"
+cache_size = 100000
+
+[broker]
+host = "mosquitto"
+port = 1883
+user = ""
+password = ""
+client_id = "loxmqttrelay-loadtest"
+mqtt_version = "3.1"
+
+[miniserver]
+miniserver_ip = "127.0.0.1"
+miniserver_port = 80
+miniserver_user = ""
+miniserver_pass = ""
+# How many concurrent HTTP requests the relay fires at the Miniserver at once.
+# Tune this to see its effect on loss/latency under load (default in the shipped
+# config is 5, which is realistic for a real Miniserver but limits throughput).
+miniserver_max_parallel_connections = 20
+sync_with_miniserver = false
+use_websocket = false
+
+[topics]
+# Everything published under loadtest/cmd/# is forwarded to the (mock) Miniserver.
+subscriptions = ["loadtest/cmd/#"]
+subscription_filters = []
+topic_whitelist = []
+do_not_forward = []
+
+[processing]
+expand_json = false
+convert_booleans = false
+
+[udp]
+udp_in_port = 11884
+
+[debug]
+mock_ip = "miniserver-mock:8080"
+enable_mock = true
