@@ -194,6 +194,60 @@ capping them would trade a real reliability property (self-healing after an outa
 theoretical concern that no longer applies. Only the leak was fixed; reconnect attempt count, delay,
 and all other reconnect behavior are unchanged.
 
+### 8. Unsynchronized heartbeat write - a plausible cause of "code 1000" disconnects
+
+Follow-up to finding 7's production log: WebSocket close code `1000` is RFC 6455's "normal
+closure" - the Miniserver closed the connection *on purpose*, not because of a network-level
+failure. In practice that means one of: a Miniserver reboot/firmware update, or the Miniserver
+judging the client's heartbeat to have failed. The first two aren't something this relay can do
+anything about; the third has a concrete, fixable mechanism behind it.
+
+`loxwebsocket/lox_ws_api.py`'s `async_init()` explicitly disables both of aiohttp's own
+keep-alive mechanisms:
+
+```python
+self._ws = await self._session.ws_connect(
+    f"{self._loxone_ws_url}/ws/rfc6455",
+    timeout=c.TIMEOUT,
+    heartbeat=None,     # aiohttp's built-in heartbeat: off
+    autoping=False       # WebSocket-level ping/pong: off
+)
+```
+
+so the *entire* heartbeat responsibility rests on `LoxWs.keep_alive()`, a background task that
+sends a plaintext `"keepalive"` frame every `KEEP_ALIVE_PERIOD` (60s):
+
+```python
+async def keep_alive(self, second: int) -> None:
+    try:
+        while self.state == "CONNECTED":
+            await asyncio.sleep(second)
+            async with asyncio.Lock():          # a FRESH Lock object every iteration!
+                await self._ws.send_str("keepalive")
+    except Exception as e:
+        await self.handle_connection_interrupt(exception=e)
+```
+
+`async with asyncio.Lock():` constructs a brand-new, unshared `Lock` instance on every loop
+iteration - nothing else ever contends for that specific object, so it provides no actual mutual
+exclusion at all. Crucially, `keep_alive()` runs as its own independent background task
+(`start()`'s `asyncio.create_task(self.keep_alive(...), name="keepalive")`), completely unaware of
+`HttpMiniserverHandler._ws_write_lock` (finding 2's fix, this repo's own code, a different module
+entirely) that serializes *our* command sends. Nothing serializes the keepalive write against a
+concurrent command write.
+
+`aiohttp` does not guarantee that concurrent, unsynchronized `send_str()` calls on the same
+websocket stay un-interleaved on the wire. If the plaintext `"keepalive"` write happens to
+interleave with an encrypted `jdev/sys/enc/...` command write, the Miniserver can receive a
+malformed frame sequence - and a Miniserver that can't make sense of what it just received has no
+better option than to close the connection, plausibly reporting that as a clean, deliberate
+closure (code 1000) rather than diagnosing the frame corruption itself.
+
+Separately, `handle_connection_interrupt()`'s `match close_code:` has no `case 1000:` - it falls
+into `case _: "Connection closed unexpectedly with unknown code: {code}"`, which actively
+mislabels a normal closure as "unexpected"/"unknown" in the log, obscuring exactly the distinction
+that matters when diagnosing this.
+
 ## Fixes
 
 ### Response correlation + retry (`src/loxmqttrelay/websocket_ack.py`, new)
@@ -286,6 +340,56 @@ directly (with fake session/`self` objects), without needing a real or even patc
 instance and without touching the network. `_max_reconnect_attempts` (currently unlimited/`0`) is
 deliberately left unchanged - see finding 7 for why a cap was considered and rejected.
 
+### `loxwebsocket` heartbeat/command write serialization (`src/loxmqttrelay/loxwebsocket_compat.py`)
+
+Fixes finding 8. Rather than patch every individual call site that writes to the websocket
+(`keep_alive()`, `send_command()`, `send_websocket_command()`, the two visu-password-secured
+variants - fragile if the library adds more later), this wraps `self._ws.send_str` itself with one
+shared lock the moment the connection is established, i.e. right after `async_init()` assigns a
+new `self._ws`:
+
+```python
+async def patched_async_init(self):
+    result = await original_async_init(self)
+    wrap_ws_send_str_with_shared_lock(self)
+    return result
+
+def wrap_ws_send_str_with_shared_lock(instance):
+    lock = getattr(instance, "_loxmqttrelay_write_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        instance._loxmqttrelay_write_lock = lock  # persists across reconnects
+
+    ws = getattr(instance, "_ws", None)
+    if ws is None or getattr(ws.send_str, "_loxmqttrelay_patched", False):
+        return
+
+    original_send_str = ws.send_str
+    async def locked_send_str(data, *args, **kwargs):
+        async with lock:
+            return await original_send_str(data, *args, **kwargs)
+    locked_send_str._loxmqttrelay_patched = True
+    ws.send_str = locked_send_str
+```
+
+Every future write through that connection - `keep_alive()`'s heartbeat, any of `loxwebsocket`'s
+own command sends, and this repo's own `send_to_minisever_via_websocket()` - now goes through the
+same lock automatically, regardless of which piece of code initiated it. The lock is created once
+per `LoxWs` instance and reused across reconnects (a fresh `self._ws` is wrapped again on each
+reconnect, but the lock object itself doesn't change). `HttpMiniserverHandler._ws_write_lock`
+(finding 2's original fix) is left in place rather than removed - harmless, minor redundancy, and
+this new patch is a strict superset of what it covered.
+
+A second, purely additive patch wraps `handle_connection_interrupt()` to log a clear, explicit
+line whenever `close_code == 1000`, without changing any reconnect behavior:
+
+```python
+async def patched_handle_connection_interrupt(self, msg_type=None, exception=None):
+    close_code = self._ws.close_code if self._ws else None
+    log_if_normal_closure(close_code)
+    return await original_handle_connection_interrupt(self, msg_type=msg_type, exception=exception)
+```
+
 ### Per-topic sequencing, with coalescing (`src/loxmqttrelay/topic_sequencer.py`, new)
 
 `TopicSequencer` ensures at most one send is in flight per (normalized) topic at a time - for
@@ -342,14 +446,21 @@ Miniserver that speaks that protocol, analogous to `loadtest/miniserver_mock` fo
 reimplementing a substantial part of the encrypted handshake just to mock it - out of scope for
 this pass. Instead:
 
-- **`tests/test_loxwebsocket_compat.py`** (8 tests): confirms `genarate_salt()` now returns the
+- **`tests/test_loxwebsocket_compat.py`** (16 tests): confirms `genarate_salt()` now returns the
   salt it set (not `None`), that `apply_patches()` is idempotent, and end-to-end that `encrypt()`
-  no longer embeds the literal string `"None"` as the salt; plus 5 tests for the reconnect
+  no longer embeds the literal string `"None"` as the salt; 5 tests for the reconnect
   session-leak fix (finding 7) against `_close_stale_session_and_call()` directly with fake
   session/`self` objects - closes an open stale session before calling the original, skips closing
   an already-closed one, handles the very first connect (no session yet at all), still runs the
   original even if closing the stale session raises, and confirms the patch installs on `LoxWs`
-  idempotently.
+  idempotently; and 8 tests for finding 8's fixes against `wrap_ws_send_str_with_shared_lock()` and
+  `log_if_normal_closure()` directly - a **load-style concurrency test** firing 20 concurrent
+  `send_str()` calls and asserting max observed concurrency is exactly `1` (the same property
+  verified for the application-level write lock, now verified at the transport-wrapping level that
+  also covers `keep_alive()`), the same lock instance is reused across a simulated reconnect,
+  double-wrapping is a no-op, a missing `_ws` (before the first-ever connect) doesn't raise, the
+  1000-code log line fires only for code `1000` and not for other codes, and both patches install
+  on `LoxWs` idempotently.
 - **`tests/test_websocket_ack.py`** (6 tests): `WebSocketAckWaiter` registration idempotency,
   correct resolution on a matching topic, ignoring unrelated/malformed messages, timeout behavior
   and cleanup, and FIFO resolution for multiple pending waiters on the same topic.
@@ -384,7 +495,7 @@ this pass. Instead:
   - `test_send_to_miniserver_without_coalescing_sends_every_value`: the same burst with
     `miniserver_coalesce_topic_updates = false` - asserts all three are sent, in order.
 
-All 227 tests (198 existing + 29 new) pass, run inside the Docker build image (the project requires
+All 235 tests (198 existing + 37 new) pass, run inside the Docker build image (the project requires
 Python 3.14 + the compiled Rust extension, unavailable in this environment outside Docker). The
 timing-sensitive new tests were additionally run 5x in a row to check for flakiness - all passed
 every time.
@@ -422,12 +533,19 @@ every time.
      closes it) only runs once, before the loop starts. Under a sustained outage with unlimited
      retries (the default), this can exhaust file descriptors, making it progressively harder to
      ever reconnect.
+  7. A plausible cause of real "code 1000" (normal closure) disconnects: the *only* heartbeat
+     mechanism (`keep_alive()`; both of aiohttp's own are explicitly disabled) writes to the shared
+     websocket guarded by a freshly-constructed, unshared `asyncio.Lock()` on every iteration - i.e.
+     no actual synchronization - and isn't coordinated with concurrent command writes at all. An
+     interleaved write can produce a malformed frame the Miniserver can't parse, which it may
+     resolve by simply closing the connection.
 - Added response correlation + retry with exponential backoff (`websocket_ack.py`,
   `send_to_minisever_via_websocket()`), a write lock serializing the encrypt+send step, a fix for
-  the reconnect race, narrow runtime patches for the `genarate_salt()` bug and the reconnect
-  session leak (`loxwebsocket_compat.py`, isolated so they can be dropped once fixed upstream), and
-  a per-topic send sequencer (`topic_sequencer.py`) applied to both HTTP and WebSocket, with an
-  optional coalescing mode that drops superseded, not-yet-sent values instead of queueing every one.
+  the reconnect race, narrow runtime patches for the `genarate_salt()` bug, the reconnect session
+  leak, and the unsynchronized heartbeat write (`loxwebsocket_compat.py`, isolated so they can be
+  dropped once fixed upstream), and a per-topic send sequencer (`topic_sequencer.py`) applied to
+  both HTTP and WebSocket, with an optional coalescing mode that drops superseded, not-yet-sent
+  values instead of queueing every one.
 - New `[miniserver]` options: `miniserver_websocket_retry_attempts` (default `3`),
   `miniserver_websocket_retry_backoff_seconds` (default `0.5`),
   `miniserver_websocket_ack_timeout_seconds` (default `5.0`),
@@ -436,17 +554,19 @@ every time.
 ### Why
 `use_websocket = true` is the shipped default. Without these fixes, every websocket-forwarded
 message was sent blind (no way to know if it worked), with no protection against interleaved
-writes on the shared connection, a real chance of a corrupted session salt that gets *more* likely
-under higher message volume, no guarantee that rapid messages to the same topic (a double-tapped
-switch, a short automation, a dimmer slide) would even arrive in the right order, and - as seen in
-production - a resource leak that made a real Miniserver outage harder to recover from the longer
-it lasted.
+writes on the shared connection (including against the library's own heartbeat - a plausible cause
+of real disconnects seen in production), a real chance of a corrupted session salt that gets *more*
+likely under higher message volume, no guarantee that rapid messages to the same topic (a
+double-tapped switch, a short automation, a dimmer slide) would even arrive in the right order, and
+- also seen in production - a resource leak that made a real Miniserver outage harder to recover
+from the longer it lasted.
 
 ### Changes
 - `src/loxmqttrelay/websocket_ack.py` (new): `WebSocketAckWaiter` - correlates outgoing commands
   with the Miniserver's response by topic.
-- `src/loxmqttrelay/loxwebsocket_compat.py` (new): runtime patches for the `genarate_salt()` bug
-  and the reconnect-loop `ClientSession` leak.
+- `src/loxmqttrelay/loxwebsocket_compat.py` (new): runtime patches for the `genarate_salt()` bug,
+  the reconnect-loop `ClientSession` leak, unsynchronized heartbeat/command writes, and clearer
+  logging for close code 1000.
 - `src/loxmqttrelay/topic_sequencer.py` (new): `TopicSequencer` - per-topic send serialization with
   optional coalescing, applied to both HTTP and WebSocket at the `send_to_miniserver()` entry point.
 - `src/loxmqttrelay/http_miniserver_handler.py`: `send_to_minisever_via_websocket()` rewritten to
@@ -461,12 +581,20 @@ it lasted.
   ordering bug's exact repro scenario.
 
 ### Test Plan
-- [x] `pytest` (198 existing + 29 new tests, 227 total) passes, run inside the Docker build image;
+- [x] `pytest` (198 existing + 37 new tests, 235 total) passes, run inside the Docker build image;
       timing-sensitive new tests additionally run 5x in a row to check for flakiness.
 - [x] `test_close_stale_session_and_call_*` (4 tests) / `test_async_init_patch_is_installed_and_idempotent`:
       confirms the reconnect session-leak fix closes a stale open session before reconnecting,
       leaves an already-closed one alone, handles the very first connect, still proceeds if closing
       fails, and installs on `LoxWs` idempotently.
+- [x] `test_wrap_ws_send_str_serializes_concurrent_writes`: load-style test firing 20 concurrent
+      `send_str()` calls through the transport-level lock (the one that now also covers
+      `keep_alive()`), asserts max observed concurrency is exactly 1.
+- [x] `test_wrap_ws_send_str_reuses_same_lock_across_reconnects` / `..._is_idempotent_per_ws` /
+      `..._handles_missing_ws_gracefully`: confirms the lock survives a simulated reconnect,
+      wrapping twice doesn't double-wrap, and a not-yet-connected instance doesn't raise.
+- [x] `test_log_if_normal_closure_logs_on_code_1000` / `..._stays_silent_on_other_codes`: confirms
+      the new log line fires only for code 1000.
 - [x] `test_websocket_send_succeeds_on_first_ack` / `..._retries_after_timeout_then_succeeds` /
       `..._retries_on_non_200_code` / `..._gives_up_after_max_retries`: confirms the retry
       behavior end to end against a scripted fake client.
@@ -503,6 +631,13 @@ it lasted.
   to recover from an outage of unknown duration, and the leak that made unlimited retries risky is
   now fixed. Only raise this again if a *different* failure mode (not resource exhaustion) is found
   that unlimited retries make worse.
+- Finding 8 (unsynchronized heartbeat writes as a cause of code-1000 disconnects) is, like the salt
+  bug, justified by the source-level defect being unambiguous (a fresh, unshared `Lock()` per
+  iteration provides no real exclusion), not by a confirmed observation against real Miniserver
+  hardware that a corrupted keepalive frame specifically triggers the closure. It was raised by the
+  user from field experience with what code 1000 usually means for Loxone Miniservers; the fix
+  closes a real synchronization gap regardless of whether it's the exact mechanism behind any one
+  specific production disconnect.
 - This branch is independent of `fix/miniserver-http-session-reuse-and-basetopic-warning` and
   `feature/defensive-whitelist-sync` - all three are based on `main` and can be reviewed/merged in
   any order.

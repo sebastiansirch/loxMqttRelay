@@ -1,8 +1,16 @@
+import asyncio
+import logging
+
 import pytest
 
 from loxwebsocket.encryption import LxEncryptionHandler
 from loxwebsocket.lox_ws_api import LoxWs
-from loxmqttrelay.loxwebsocket_compat import apply_patches, _close_stale_session_and_call
+from loxmqttrelay.loxwebsocket_compat import (
+    apply_patches,
+    _close_stale_session_and_call,
+    wrap_ws_send_str_with_shared_lock,
+    log_if_normal_closure,
+)
 
 
 def test_genarate_salt_returns_the_salt_it_set():
@@ -151,6 +159,15 @@ async def test_close_stale_session_and_call_still_runs_original_if_close_fails()
 
 
 def test_async_init_patch_is_installed_and_idempotent():
+    """
+    Note: LoxWs.async_init ends up wrapped by more than one patch (the
+    stale-session-close patch and the write-serialization patch both wrap
+    it), so the outermost function only carries the *last* patch's marker.
+    Idempotency - no additional wrapping on repeated apply_patches() calls -
+    is what's actually being verified here; see
+    test_patch_websocket_write_serialization_is_installed_and_idempotent for
+    that patch's own marker check.
+    """
     apply_patches()
     patched_once = LoxWs.async_init
 
@@ -158,4 +175,117 @@ def test_async_init_patch_is_installed_and_idempotent():
     apply_patches()
 
     assert LoxWs.async_init is patched_once
-    assert getattr(LoxWs.async_init, "_loxmqttrelay_patched", False) is True
+
+
+# --- shared write lock (keepalive vs. commands) ---
+
+class _FakeWs:
+    def __init__(self):
+        self.sent = []
+
+    async def send_str(self, data):
+        self.sent.append(data)
+
+
+class _FakeSelf:
+    pass
+
+
+@pytest.mark.asyncio
+async def test_wrap_ws_send_str_serializes_concurrent_writes():
+    """
+    Load-style regression test for the keepalive/command race: fire many
+    concurrent send_str() calls (as keep_alive() and command sends would
+    under load) and confirm the wrapped version never lets two run at once.
+    """
+    instance = _FakeSelf()
+    instance._ws = _FakeWs()
+
+    concurrency = {"current": 0, "max": 0}
+    original_send_str = instance._ws.send_str
+
+    async def tracking_send_str(data):
+        concurrency["current"] += 1
+        concurrency["max"] = max(concurrency["max"], concurrency["current"])
+        await asyncio.sleep(0.01)
+        concurrency["current"] -= 1
+        await original_send_str(data)
+
+    instance._ws.send_str = tracking_send_str
+
+    wrap_ws_send_str_with_shared_lock(instance)
+
+    await asyncio.gather(*[instance._ws.send_str(f"msg{i}") for i in range(20)])
+
+    assert concurrency["max"] == 1
+    assert len(instance._ws.sent) == 20
+
+
+def test_wrap_ws_send_str_reuses_same_lock_across_reconnects():
+    instance = _FakeSelf()
+    instance._ws = _FakeWs()
+
+    wrap_ws_send_str_with_shared_lock(instance)
+    lock_first = instance._loxmqttrelay_write_lock
+
+    # simulate a reconnect: a brand new _ws object is assigned
+    instance._ws = _FakeWs()
+    wrap_ws_send_str_with_shared_lock(instance)
+
+    assert instance._loxmqttrelay_write_lock is lock_first
+
+
+def test_wrap_ws_send_str_is_idempotent_per_ws():
+    instance = _FakeSelf()
+    instance._ws = _FakeWs()
+
+    wrap_ws_send_str_with_shared_lock(instance)
+    wrapped_once = instance._ws.send_str
+    wrap_ws_send_str_with_shared_lock(instance)
+
+    assert instance._ws.send_str is wrapped_once
+
+
+def test_wrap_ws_send_str_handles_missing_ws_gracefully():
+    instance = _FakeSelf()  # no ._ws attribute set at all yet
+
+    wrap_ws_send_str_with_shared_lock(instance)  # must not raise
+
+
+def test_patch_websocket_write_serialization_is_installed_and_idempotent():
+    apply_patches()
+    patched_once = LoxWs.async_init
+
+    apply_patches()
+    apply_patches()
+
+    assert LoxWs.async_init is patched_once
+    assert getattr(LoxWs.async_init, "_loxmqttrelay_lock_patched", False) is True
+
+
+# --- clearer logging for close code 1000 ---
+
+def test_log_if_normal_closure_logs_on_code_1000(caplog):
+    with caplog.at_level(logging.WARNING):
+        log_if_normal_closure(1000)
+
+    assert any("code 1000" in record.getMessage() for record in caplog.records)
+
+
+def test_log_if_normal_closure_stays_silent_on_other_codes(caplog):
+    with caplog.at_level(logging.WARNING):
+        log_if_normal_closure(4004)
+        log_if_normal_closure(None)
+
+    assert not any("code 1000" in record.getMessage() for record in caplog.records)
+
+
+def test_patch_normal_closure_logging_is_installed_and_idempotent():
+    apply_patches()
+    patched_once = LoxWs.handle_connection_interrupt
+
+    apply_patches()
+    apply_patches()
+
+    assert LoxWs.handle_connection_interrupt is patched_once
+    assert getattr(LoxWs.handle_connection_interrupt, "_loxmqttrelay_patched", False) is True
