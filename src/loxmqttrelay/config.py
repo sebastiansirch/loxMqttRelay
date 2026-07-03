@@ -52,6 +52,16 @@ class MiniserverConfig:
     miniserver_websocket_retry_attempts: int = 3
     miniserver_websocket_retry_backoff_seconds: float = 0.5
     miniserver_websocket_ack_timeout_seconds: float = 5.0
+    # Sends for the same topic are always serialized (never more than one in
+    # flight at a time, HTTP or WebSocket) to prevent a retried older value
+    # from landing after a newer one that already succeeded. If a newer
+    # value arrives for a topic while the previous one is still queued (not
+    # yet sent), this decides whether to drop the superseded one (true,
+    # matches Loxone virtual inputs' last-write-wins semantics, avoids
+    # sending values that are already stale) or to still send every value in
+    # order (false, higher latency under a burst on one topic, no value ever
+    # dropped).
+    miniserver_coalesce_topic_updates: bool = True
 
 @dataclass
 class TopicsConfig:

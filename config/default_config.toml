@@ -27,6 +27,11 @@ use_websocket = true
 miniserver_websocket_retry_attempts = 3
 miniserver_websocket_retry_backoff_seconds = 0.5
 miniserver_websocket_ack_timeout_seconds = 5.0
+# Sends for the same topic are always serialized (never more than one in
+# flight at a time). If a newer value arrives for a topic while the previous
+# one is still queued, drop the superseded one (true, last-write-wins) or
+# still send every value in order (false, nothing ever dropped).
+miniserver_coalesce_topic_updates = true
 
 [topics]
 subscriptions = ["topic3"]

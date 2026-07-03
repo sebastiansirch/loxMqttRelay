@@ -5,6 +5,7 @@ from loxmqttrelay.config import global_config
 from loxmqttrelay.logging_config import get_lazy_logger
 from loxmqttrelay.loxwebsocket_compat import apply_patches as apply_loxwebsocket_patches
 from loxmqttrelay.websocket_ack import WebSocketAckWaiter
+from loxmqttrelay.topic_sequencer import TopicSequencer
 from loxwebsocket.lox_ws_api import loxwebsocket
 
 logger = get_lazy_logger(__name__)
@@ -52,6 +53,10 @@ class HttpMiniserverHandler:
         # while still letting each caller await its own response
         # independently afterwards.
         self._ws_write_lock = asyncio.Lock()
+        # Serializes sends per topic (HTTP or WebSocket) so a retried older
+        # value can never land after a newer one that already went out - see
+        # topic_sequencer.py.
+        self._topic_sequencer = TopicSequencer()
 
     async def _ensure_websocket_connected(self, ws_client, timeout: float = 30.0) -> bool:
         """
@@ -206,21 +211,35 @@ class HttpMiniserverHandler:
     ) -> None:
         """
         Process data and send it to Miniserver.
-        
+
+        Queues the send through the per-topic sequencer instead of sending
+        immediately: without that, two rapid messages on the same topic race
+        (nothing upstream of this call - gmqtt's dispatch, the Rust
+        forwarder - serializes them), and a retried older value could
+        physically land at the Miniserver after a newer one that already
+        succeeded. See topic_sequencer.py.
+
         Args:
             data: The data to process and send
             mqtt_publish_callback: Callback for MQTT publishing (required for topic forwarding)
-            
+
         Returns:
             None
         """
         logger.debug(f"Sending {topic} (as {normalized_topic})={value} to Miniserver")
-        # Send to Miniserver using WebSocket or HTTP based on config
-        if global_config.miniserver.use_websocket:
-            await self.send_to_minisever_via_websocket(topic, normalized_topic, value)
-        else:
-            await self.send_to_miniserver_via_http(topic, normalized_topic, value)
 
-        return 
+        async def _send() -> None:
+            # Send to Miniserver using WebSocket or HTTP based on config
+            if global_config.miniserver.use_websocket:
+                await self.send_to_minisever_via_websocket(topic, normalized_topic, value)
+            else:
+                await self.send_to_miniserver_via_http(topic, normalized_topic, value)
+
+        await self._topic_sequencer.submit(
+            normalized_topic,
+            _send,
+            coalesce=global_config.miniserver.miniserver_coalesce_topic_updates,
+            description=f"{normalized_topic}={value}",
+        )
 
 http_miniserver_handler = HttpMiniserverHandler()

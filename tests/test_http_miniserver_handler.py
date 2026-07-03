@@ -348,6 +348,9 @@ class FakeWsClient:
         # If there are more sends than entries, the last entry (or {"Code": "200"}
         # if the list is empty) is reused.
         self.responses: List[Optional[dict]] = []
+        # How long a scheduled response takes to "arrive" - bump this in a
+        # test that needs a send to still be in flight for a while.
+        self.deliver_delay = 0.005
 
     def add_message_callback(self, callback, message_types=None) -> None:
         self._callbacks.append(callback)
@@ -367,7 +370,7 @@ class FakeWsClient:
             asyncio.create_task(self._deliver(topic, response))
 
     async def _deliver(self, topic: str, ll: dict) -> None:
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(self.deliver_delay)
         event_dict = {topic.encode(): ll}
         for callback in list(self._callbacks):
             await callback(event_dict, 0)
@@ -515,3 +518,100 @@ async def test_websocket_writes_are_serialized_under_concurrent_load(
 
     assert concurrency["max"] == 1
     assert len(fake_ws.sent) == 50
+
+
+# Per-Topic Ordering Tests (via the send_to_miniserver() entry point, which
+# routes through TopicSequencer)
+
+async def _drain(handler: HttpMiniserverHandler, topic: str, timeout: float = 2.0) -> None:
+    """Wait until TopicSequencer has fully finished processing `topic`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while topic in handler._topic_sequencer._running:
+        if loop.time() > deadline:
+            raise AssertionError(f"topic '{topic}' did not drain within {timeout}s")
+        await asyncio.sleep(0.005)
+
+
+@pytest.fixture
+def no_coalesce_setting() -> Generator[None, None, None]:
+    ms = global_config.miniserver
+    original = ms.miniserver_coalesce_topic_updates
+    ms.miniserver_coalesce_topic_updates = False
+    yield
+    ms.miniserver_coalesce_topic_updates = original
+
+
+@pytest.mark.asyncio
+async def test_send_to_miniserver_prevents_reordering_across_a_retry(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None, no_coalesce_setting: None
+) -> None:
+    """
+    Regression test for the found-and-fixed ordering bug: "off"'s first
+    attempt is dropped (forcing a retry); "on" for the SAME topic is
+    submitted immediately after, without waiting for "off" to finish. Per-
+    topic sequencing must ensure "on" is only sent once "off" (including its
+    retry) has fully completed - never interleaved, never overtaking it.
+    """
+    fake_ws = FakeWsClient()
+    fake_ws.responses = [None, {"Code": "200"}, {"Code": "200"}]
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        task_off = asyncio.create_task(handler.send_to_miniserver("light", "light", "off"))
+        await asyncio.sleep(0)  # let "off" actually start (and issue its first send)
+        task_on = asyncio.create_task(handler.send_to_miniserver("light", "light", "on"))
+
+        await asyncio.gather(task_off, task_on)
+        await _drain(handler, "light")
+
+    values = [v for _, v in fake_ws.sent]
+    assert values == ["off", "off", "on"]  # off retried once, then on - never reordered
+
+
+@pytest.mark.asyncio
+async def test_send_to_miniserver_coalesces_by_default_under_rapid_updates(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    """
+    Three rapid updates to the same topic; the first is still in flight
+    (waiting on its ack) when the second and third are submitted. With the
+    default coalescing behavior, the second must be dropped in favor of the
+    third - only the first and the latest value are ever actually sent.
+    """
+    assert global_config.miniserver.miniserver_coalesce_topic_updates is True
+
+    fake_ws = FakeWsClient()
+    fake_ws.deliver_delay = 0.03  # keeps the first send's ack pending for a while
+    fake_ws.responses = [{"Code": "200"}] * 5
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        asyncio.create_task(handler.send_to_miniserver("dimmer", "dimmer", 30))
+        await asyncio.sleep(0.005)  # let 30 actually start sending
+        asyncio.create_task(handler.send_to_miniserver("dimmer", "dimmer", 60))
+        asyncio.create_task(handler.send_to_miniserver("dimmer", "dimmer", 90))
+
+        await _drain(handler, "dimmer")
+
+    values = [v for _, v in fake_ws.sent]
+    assert values == ["30", "90"]  # 60 was superseded before it was ever sent
+
+
+@pytest.mark.asyncio
+async def test_send_to_miniserver_without_coalescing_sends_every_value(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None, no_coalesce_setting: None
+) -> None:
+    """Same burst as above, but with coalescing disabled - nothing is dropped."""
+    fake_ws = FakeWsClient()
+    fake_ws.deliver_delay = 0.03
+    fake_ws.responses = [{"Code": "200"}] * 5
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        asyncio.create_task(handler.send_to_miniserver("dimmer", "dimmer", 30))
+        await asyncio.sleep(0.005)
+        asyncio.create_task(handler.send_to_miniserver("dimmer", "dimmer", 60))
+        asyncio.create_task(handler.send_to_miniserver("dimmer", "dimmer", 90))
+
+        await _drain(handler, "dimmer")
+
+    values = [v for _, v in fake_ws.sent]
+    assert values == ["30", "60", "90"]

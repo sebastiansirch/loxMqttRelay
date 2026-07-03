@@ -90,7 +90,47 @@ which can run a second, concurrent handshake (`async_init()`) against the same `
 while the library's own reconnect is already mid-flight. More load means more messages means a
 higher chance one lands exactly in that window.
 
-### 5. Whitelist-sync bug is unaffected either way
+### 5. No ordering guarantee for rapid successive messages on the same topic
+
+A follow-up question after the above fixes shipped: is it guaranteed that rapid successive
+messages on the same topic arrive at the Miniserver in the order they were sent? No, at multiple
+independent layers:
+
+- **gmqtt** dispatches every incoming MQTT message as its own `asyncio.ensure_future(...)` task
+  (`gmqtt/mqtt/utils.py`, `run_coroutine_or_function`) - it never awaits one message's handler
+  before starting the next.
+- **The Rust dispatcher** spawns each forward onto its own Tokio task
+  (`pyo3_async_runtimes::tokio::get_runtime().spawn(...)`, `src/lib.rs`) rather than awaiting it -
+  again, no serialization between consecutive messages on the same topic.
+- **The HTTP path** allows up to `miniserver_max_parallel_connections` (default `5`) requests in
+  flight at once, with no per-topic queue - two requests to the same topic can be in flight over
+  different connections with no guarantee which one the Miniserver processes first.
+- **The WebSocket path**, even with the write lock added above, only serializes the *send* (the
+  `encrypt()+send_str()` step) - not the full send-plus-retry cycle. This was verified with a
+  concrete repro: sending `"off"` (whose first attempt is dropped, forcing a retry) immediately
+  followed by `"on"` for the same topic produced
+
+  ```
+  Wire send order (ms, value): [(0, 'off'), (1, 'on'), (152, 'on')]
+  ```
+
+  Because `WebSocketAckWaiter` correlates by topic only, the response meant for `"on"`'s first
+  attempt resolved `"off"`'s pending wait instead (both were pending for the same topic at once) -
+  `"off"` falsely reported success on attempt 1, while `"on"` timed out waiting for a response that
+  had already been consumed, and had to retry ~150ms later. The final value happened to be correct
+  in this run, but only by chance - with different timing the retried `"off"` could just as easily
+  have landed *after* `"on"` and overwritten it.
+
+  Critically, this isn't a rare, exotic race: it only requires ONE message to hit any transient
+  failure (a dropped ack, a timeout, a brief Miniserver hiccup) for the danger window to open. With
+  the retry defaults, that window is up to `~16.5s` for WebSocket
+  (`3 × (ack_timeout + backoff) ≈ 3 × 5.5s`) or `~31.5s` for HTTP
+  (`3 × (10s timeout + backoff)`) - any second message to the same topic sent within that window
+  after the first one's failure is at risk. That covers very ordinary cases: a light switch
+  double-tapped within a few seconds, a short "on, wait 2s, off" automation, or a dimmer/slider
+  sending several updates in a row.
+
+### 6. Whitelist-sync bug is unaffected either way
 
 The whitelist-overwrite bug found and fixed on `feature/defensive-whitelist-sync` (see
 `docs/defensive-whitelist-sync.md`) happens in Rust's `process_data()`, before the HTTP/WebSocket
@@ -167,12 +207,52 @@ This delegates to the original method for the actual salt-generation logic (so i
 upstream changes that part) and only fixes the missing `return`. Isolated in its own module so it
 can be deleted cleanly once a fixed `loxwebsocket` release exists upstream.
 
+### Per-topic sequencing, with coalescing (`src/loxmqttrelay/topic_sequencer.py`, new)
+
+`TopicSequencer` ensures at most one send is in flight per (normalized) topic at a time - for
+*both* HTTP and WebSocket, since it's applied at the shared `send_to_miniserver()` entry point
+rather than inside either protocol-specific method:
+
+```python
+async def send_to_miniserver(self, topic, normalized_topic, value):
+    async def _send():
+        if global_config.miniserver.use_websocket:
+            await self.send_to_minisever_via_websocket(topic, normalized_topic, value)
+        else:
+            await self.send_to_miniserver_via_http(topic, normalized_topic, value)
+
+    await self._topic_sequencer.submit(
+        normalized_topic, _send,
+        coalesce=global_config.miniserver.miniserver_coalesce_topic_updates,
+        description=f"{normalized_topic}={value}",
+    )
+```
+
+For a given topic, `TopicSequencer` runs a background worker that processes one queued send at a
+time. This closes finding 5 at its root: since only one send-and-retry cycle for a topic is ever
+in flight, `WebSocketAckWaiter` never has more than one pending waiter for that topic either,
+eliminating the cross-resolution bug demonstrated above as a side effect - not just delaying the
+symptom.
+
+`miniserver_coalesce_topic_updates` (default `true`) controls what happens when a newer value
+arrives for a topic while the previous one is still queued (not yet started sending):
+- `true`: the superseded, not-yet-sent value is dropped - only the latest one is sent once it's
+  that topic's turn. Matches Loxone virtual inputs' last-write-wins semantics and avoids spending a
+  full send-and-retry cycle on a value that would be immediately overwritten anyway.
+- `false`: every value is still sent, strictly in arrival order, one at a time per topic - nothing
+  is ever dropped, at the cost of added latency for that topic under a sustained burst.
+
+Note what coalescing does and doesn't affect: it only ever drops a value that hasn't started
+sending yet. A value that's already being sent (including through its retries) always runs to
+completion before the next queued item for that topic is even considered.
+
 ### New `[miniserver]` config options
 
 ```toml
 miniserver_websocket_retry_attempts = 3          # total attempts, incl. the first; 1 disables retrying
 miniserver_websocket_retry_backoff_seconds = 0.5 # doubles after each retry
 miniserver_websocket_ack_timeout_seconds = 5.0   # how long to wait for a response per attempt
+miniserver_coalesce_topic_updates = true         # drop superseded, not-yet-sent values per topic
 ```
 
 ## Testing
@@ -204,9 +284,26 @@ this pass. Instead:
     simultaneously, and asserts the observed maximum concurrency is exactly `1` - i.e. the write
     lock genuinely prevents overlapping writes under a realistic message burst, not just in
     isolation.
+- **`tests/test_topic_sequencer.py`** (5 tests, new): same-topic sends never overlap and run in
+  order without coalescing; a value superseded before it started is dropped with coalescing on;
+  different topics run fully independently and concurrently; internal bookkeeping is cleaned up
+  once a topic's queue drains; a raising send doesn't stop later sends for the same topic.
+- **3 more tests in `tests/test_http_miniserver_handler.py`**, going through the actual
+  `send_to_miniserver()` entry point (not the protocol-specific methods directly), reproducing
+  finding 5's exact repro scenario and proving it's fixed:
+  - `test_send_to_miniserver_prevents_reordering_across_a_retry`: the `"off"`/`"on"` scenario from
+    finding 5, with coalescing off - asserts the wire order is `["off", "off", "on"]` (the retry
+    completes before `"on"` is ever sent), never interleaved.
+  - `test_send_to_miniserver_coalesces_by_default_under_rapid_updates`: three rapid values to one
+    topic, the first still in flight when the second and third arrive - asserts only the first and
+    last are ever sent.
+  - `test_send_to_miniserver_without_coalescing_sends_every_value`: the same burst with
+    `miniserver_coalesce_topic_updates = false` - asserts all three are sent, in order.
 
-All 214 tests (198 existing + 16 new) pass, run inside the Docker build image (the project requires
-Python 3.14 + the compiled Rust extension, unavailable in this environment outside Docker).
+All 222 tests (198 existing + 24 new) pass, run inside the Docker build image (the project requires
+Python 3.14 + the compiled Rust extension, unavailable in this environment outside Docker). The
+timing-sensitive new tests were additionally run 5x in a row to check for flakiness - all passed
+every time.
 
 ---
 
@@ -231,35 +328,49 @@ Python 3.14 + the compiled Rust extension, unavailable in this environment outsi
      thereafter, i.e. *more often* under higher message throughput.
   4. A race between the relay's own opportunistic `connect()` call and `loxwebsocket`'s internal
      `reconnect()` loop, which bypasses the same lock.
+  5. No ordering guarantee for rapid successive messages on the same topic, at three independent
+     layers (gmqtt's dispatch, the Rust forwarder's task spawn, and the send layer itself) - a
+     retried older value could physically land at the Miniserver after a newer one that already
+     succeeded. Verified with a concrete repro, and made worse by `WebSocketAckWaiter`'s per-topic
+     (not per-command) correlation, which could resolve the wrong in-flight call for the same topic.
 - Added response correlation + retry with exponential backoff (`websocket_ack.py`,
   `send_to_minisever_via_websocket()`), a write lock serializing the encrypt+send step, a fix for
-  the reconnect race, and a narrow runtime patch for the `genarate_salt()` bug
-  (`loxwebsocket_compat.py`, isolated so it can be dropped once fixed upstream).
+  the reconnect race, a narrow runtime patch for the `genarate_salt()` bug
+  (`loxwebsocket_compat.py`, isolated so it can be dropped once fixed upstream), and a per-topic
+  send sequencer (`topic_sequencer.py`) applied to both HTTP and WebSocket, with an optional
+  coalescing mode that drops superseded, not-yet-sent values instead of queueing every one.
 - New `[miniserver]` options: `miniserver_websocket_retry_attempts` (default `3`),
   `miniserver_websocket_retry_backoff_seconds` (default `0.5`),
-  `miniserver_websocket_ack_timeout_seconds` (default `5.0`).
+  `miniserver_websocket_ack_timeout_seconds` (default `5.0`),
+  `miniserver_coalesce_topic_updates` (default `true`).
 
 ### Why
 `use_websocket = true` is the shipped default. Without these fixes, every websocket-forwarded
 message was sent blind (no way to know if it worked), with no protection against interleaved
-writes on the shared connection, and a real chance of a corrupted session salt that gets *more*
-likely, not less, under higher message volume.
+writes on the shared connection, a real chance of a corrupted session salt that gets *more* likely
+under higher message volume, and no guarantee that rapid messages to the same topic (a double-
+tapped switch, a short automation, a dimmer slide) would even arrive in the right order.
 
 ### Changes
 - `src/loxmqttrelay/websocket_ack.py` (new): `WebSocketAckWaiter` - correlates outgoing commands
   with the Miniserver's response by topic.
 - `src/loxmqttrelay/loxwebsocket_compat.py` (new): runtime patch for the `genarate_salt()` bug.
+- `src/loxmqttrelay/topic_sequencer.py` (new): `TopicSequencer` - per-topic send serialization with
+  optional coalescing, applied to both HTTP and WebSocket at the `send_to_miniserver()` entry point.
 - `src/loxmqttrelay/http_miniserver_handler.py`: `send_to_minisever_via_websocket()` rewritten to
   wait for and check the response, retry with backoff, serialize writes via `self._ws_write_lock`,
-  and avoid the reconnect race via `_ensure_websocket_connected()`.
-- `src/loxmqttrelay/config.py`, `config/default_config.toml`: three new `[miniserver]` options.
-- `README.md`: documents the new retry/ack-timeout options for WebSocket communication.
-- `tests/test_loxwebsocket_compat.py`, `tests/test_websocket_ack.py` (new), and 7 new tests in
-  `tests/test_http_miniserver_handler.py`, including a concurrency/load-style test for the write
-  lock.
+  and avoid the reconnect race via `_ensure_websocket_connected()`; `send_to_miniserver()` now
+  routes through `TopicSequencer`.
+- `src/loxmqttrelay/config.py`, `config/default_config.toml`: four new `[miniserver]` options.
+- `README.md`: documents the new retry/ack-timeout/coalescing options.
+- `tests/test_loxwebsocket_compat.py`, `tests/test_websocket_ack.py`, `tests/test_topic_sequencer.py`
+  (all new), and 10 new tests in `tests/test_http_miniserver_handler.py`, including a
+  concurrency/load-style test for the write lock and an end-to-end regression test reproducing the
+  ordering bug's exact repro scenario.
 
 ### Test Plan
-- [x] `pytest` (198 existing + 16 new tests, 214 total) passes, run inside the Docker build image.
+- [x] `pytest` (198 existing + 24 new tests, 222 total) passes, run inside the Docker build image;
+      timing-sensitive new tests additionally run 5x in a row to check for flakiness.
 - [x] `test_websocket_send_succeeds_on_first_ack` / `..._retries_after_timeout_then_succeeds` /
       `..._retries_on_non_200_code` / `..._gives_up_after_max_retries`: confirms the retry
       behavior end to end against a scripted fake client.
@@ -269,6 +380,11 @@ likely, not less, under higher message volume.
       max observed concurrent `send_websocket_command()` executions is exactly 1.
 - [x] `test_genarate_salt_returns_the_salt_it_set` / `test_encrypt_no_longer_embeds_none_as_the_salt`:
       confirms the salt patch fixes the actual bug symptom, not just the return value in isolation.
+- [x] `test_send_to_miniserver_prevents_reordering_across_a_retry`: reproduces finding 5's exact
+      scenario end to end and confirms it no longer reorders.
+- [x] `test_send_to_miniserver_coalesces_by_default_under_rapid_updates` /
+      `..._without_coalescing_sends_every_value`: confirms both coalescing modes behave as
+      documented.
 
 ### Notes for Reviewers
 - No full protocol-level infrastructure test (a fake Miniserver speaking the real encrypted
@@ -281,6 +397,11 @@ likely, not less, under higher message volume.
   hardware (does the unpatched "None" salt get silently accepted or rejected?) is not independently
   confirmed - the patch is justified purely by the source-level bug being unambiguous, not by an
   observed failure against real hardware.
+- `miniserver_coalesce_topic_updates` defaults to `true`, a behavior change from the previous
+  (unserialized, unordered) send path. This is intentional - there is no scenario where sending a
+  value that's already known to be stale before it even goes out is preferable to skipping it. Set
+  it to `false` for the old "send everything" behavior if every intermediate value genuinely
+  matters for some topic (e.g. accumulating counters rather than typical last-write-wins controls).
 - This branch is independent of `fix/miniserver-http-session-reuse-and-basetopic-warning` and
   `feature/defensive-whitelist-sync` - all three are based on `main` and can be reviewed/merged in
   any order.
