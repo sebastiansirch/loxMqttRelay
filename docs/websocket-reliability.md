@@ -137,6 +137,63 @@ The whitelist-overwrite bug found and fixed on `feature/defensive-whitelist-sync
 choice is made - it applies identically regardless of which one is configured. No changes needed
 here.
 
+### 7. `ClientSession` leak in `loxwebsocket`'s reconnect loop (found from production logs)
+
+A production log from a deployment running these fixes showed a long, sustained run of
+
+```
+ERROR [loxmqttrelay.http_miniserver_handler] Error sending weather/hfc1_uvi (as weather_hfc1_uvi)=0
+to Miniserver via WebSocket: WebSocket not connected (state=RECONNECTING), giving up after 3 attempt(s)
+```
+
+for many different topics in a row - the retry/give-up behavior itself working exactly as designed
+(the websocket genuinely wasn't connected, so there was nothing to send through), but persisting far
+longer than a single blip. The revealing lines were:
+
+```
+ERROR [asyncio] Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x722d97fb7b60>
+ERROR [loxwebsocket.lox_ws_api] Reconnection failed: Websocket closed while waiting for data.
+INFO  [loxwebsocket.lox_ws_api] Reconnect attempt 16 of 0
+INFO  [loxwebsocket.lox_ws_api] Waiting for 15 seconds before retrying...
+```
+
+"Reconnect attempt 16 of 0" means `_max_reconnect_attempts == 0` (unlimited - the relay never passes
+a limit to `connect()`, so `loxwebsocket`'s own default applies) and the outage had already lasted
+at least `16 × 15s ≈ 4 minutes` by this point. `loxwebsocket/lox_ws_api.py`'s `reconnect()`:
+
+```python
+async def reconnect(self) -> None:
+    ...
+    await self.stop()            # closes the old session/ws - but only ONCE, before the loop
+    self.state = "RECONNECTING"
+    while self._max_reconnect_attempts == 0 or ...:
+        ...
+        await asyncio.sleep(c.CONNECT_DELAY)      # 15s
+        ...
+        if await self.async_init():               # creates a NEW ClientSession every attempt
+            ...
+```
+
+`async_init()` unconditionally does `self._session = aiohttp.ClientSession(...)`, overwriting the
+previous attempt's session. `stop()` (which closes it) only runs once, before the retry loop starts
+- not between attempts. Every failed reconnect attempt therefore leaks the `ClientSession` (and its
+underlying sockets) it just opened - exactly the "Unclosed client session" warning in the log. Over
+a long enough outage with unlimited retries, this can exhaust file descriptors on the host, making
+it progressively *harder* to ever reconnect - a bug that can make its own root cause worse the
+longer it runs.
+
+What caused the *initial* disconnect isn't visible in the log (network blip, Miniserver reboot,
+etc.) - this finding is specifically about the resource leak that compounds it, not the trigger.
+
+Whether to also cap `_max_reconnect_attempts` (currently unlimited) was considered and explicitly
+**rejected**: this is a long-running background service that should keep trying to recover from a
+Miniserver outage of unknown duration (an hour, a day) rather than permanently give up and require
+a manual restart. Now that the leak is fixed, unlimited retries are no longer resource-dangerous -
+capping them would trade a real reliability property (self-healing after an outage) for a
+theoretical concern that no longer applies. Only the leak was fixed; reconnect attempt count, delay,
+and all other reconnect behavior are unchanged.
+
 ## Fixes
 
 ### Response correlation + retry (`src/loxmqttrelay/websocket_ack.py`, new)
@@ -207,6 +264,28 @@ This delegates to the original method for the actual salt-generation logic (so i
 upstream changes that part) and only fixes the missing `return`. Isolated in its own module so it
 can be deleted cleanly once a fixed `loxwebsocket` release exists upstream.
 
+### `loxwebsocket` reconnect session-leak patch (`src/loxmqttrelay/loxwebsocket_compat.py`)
+
+Fixes finding 7 the same way: a narrow runtime patch, not a change to reconnect behavior itself.
+`async_init()` is wrapped to close any still-open previous `self._session` before calling the
+original implementation (which opens the new one):
+
+```python
+async def _close_stale_session_and_call(instance, original_async_init):
+    old_session = getattr(instance, "_session", None)
+    if old_session is not None and not old_session.closed:
+        try:
+            await old_session.close()
+        except Exception:
+            logger.warning("Failed to close stale websocket session before reconnecting", exc_info=True)
+    return await original_async_init(instance)
+```
+
+The close-then-call logic is split into its own function specifically so it can be unit tested
+directly (with fake session/`self` objects), without needing a real or even patched `LoxWs`
+instance and without touching the network. `_max_reconnect_attempts` (currently unlimited/`0`) is
+deliberately left unchanged - see finding 7 for why a cap was considered and rejected.
+
 ### Per-topic sequencing, with coalescing (`src/loxmqttrelay/topic_sequencer.py`, new)
 
 `TopicSequencer` ensures at most one send is in flight per (normalized) topic at a time - for
@@ -263,9 +342,14 @@ Miniserver that speaks that protocol, analogous to `loadtest/miniserver_mock` fo
 reimplementing a substantial part of the encrypted handshake just to mock it - out of scope for
 this pass. Instead:
 
-- **`tests/test_loxwebsocket_compat.py`** (3 tests): confirms `genarate_salt()` now returns the
+- **`tests/test_loxwebsocket_compat.py`** (8 tests): confirms `genarate_salt()` now returns the
   salt it set (not `None`), that `apply_patches()` is idempotent, and end-to-end that `encrypt()`
-  no longer embeds the literal string `"None"` as the salt.
+  no longer embeds the literal string `"None"` as the salt; plus 5 tests for the reconnect
+  session-leak fix (finding 7) against `_close_stale_session_and_call()` directly with fake
+  session/`self` objects - closes an open stale session before calling the original, skips closing
+  an already-closed one, handles the very first connect (no session yet at all), still runs the
+  original even if closing the stale session raises, and confirms the patch installs on `LoxWs`
+  idempotently.
 - **`tests/test_websocket_ack.py`** (6 tests): `WebSocketAckWaiter` registration idempotency,
   correct resolution on a matching topic, ignoring unrelated/malformed messages, timeout behavior
   and cleanup, and FIFO resolution for multiple pending waiters on the same topic.
@@ -300,7 +384,7 @@ this pass. Instead:
   - `test_send_to_miniserver_without_coalescing_sends_every_value`: the same burst with
     `miniserver_coalesce_topic_updates = false` - asserts all three are sent, in order.
 
-All 222 tests (198 existing + 24 new) pass, run inside the Docker build image (the project requires
+All 227 tests (198 existing + 29 new) pass, run inside the Docker build image (the project requires
 Python 3.14 + the compiled Rust extension, unavailable in this environment outside Docker). The
 timing-sensitive new tests were additionally run 5x in a row to check for flakiness - all passed
 every time.
@@ -333,12 +417,17 @@ every time.
      retried older value could physically land at the Miniserver after a newer one that already
      succeeded. Verified with a concrete repro, and made worse by `WebSocketAckWaiter`'s per-topic
      (not per-command) correlation, which could resolve the wrong in-flight call for the same topic.
+  6. (found via a production log) `loxwebsocket`'s `reconnect()` loop leaks one `ClientSession` per
+     failed reconnect attempt - `async_init()` opens a new one on every attempt but `stop()` (which
+     closes it) only runs once, before the loop starts. Under a sustained outage with unlimited
+     retries (the default), this can exhaust file descriptors, making it progressively harder to
+     ever reconnect.
 - Added response correlation + retry with exponential backoff (`websocket_ack.py`,
   `send_to_minisever_via_websocket()`), a write lock serializing the encrypt+send step, a fix for
-  the reconnect race, a narrow runtime patch for the `genarate_salt()` bug
-  (`loxwebsocket_compat.py`, isolated so it can be dropped once fixed upstream), and a per-topic
-  send sequencer (`topic_sequencer.py`) applied to both HTTP and WebSocket, with an optional
-  coalescing mode that drops superseded, not-yet-sent values instead of queueing every one.
+  the reconnect race, narrow runtime patches for the `genarate_salt()` bug and the reconnect
+  session leak (`loxwebsocket_compat.py`, isolated so they can be dropped once fixed upstream), and
+  a per-topic send sequencer (`topic_sequencer.py`) applied to both HTTP and WebSocket, with an
+  optional coalescing mode that drops superseded, not-yet-sent values instead of queueing every one.
 - New `[miniserver]` options: `miniserver_websocket_retry_attempts` (default `3`),
   `miniserver_websocket_retry_backoff_seconds` (default `0.5`),
   `miniserver_websocket_ack_timeout_seconds` (default `5.0`),
@@ -348,13 +437,16 @@ every time.
 `use_websocket = true` is the shipped default. Without these fixes, every websocket-forwarded
 message was sent blind (no way to know if it worked), with no protection against interleaved
 writes on the shared connection, a real chance of a corrupted session salt that gets *more* likely
-under higher message volume, and no guarantee that rapid messages to the same topic (a double-
-tapped switch, a short automation, a dimmer slide) would even arrive in the right order.
+under higher message volume, no guarantee that rapid messages to the same topic (a double-tapped
+switch, a short automation, a dimmer slide) would even arrive in the right order, and - as seen in
+production - a resource leak that made a real Miniserver outage harder to recover from the longer
+it lasted.
 
 ### Changes
 - `src/loxmqttrelay/websocket_ack.py` (new): `WebSocketAckWaiter` - correlates outgoing commands
   with the Miniserver's response by topic.
-- `src/loxmqttrelay/loxwebsocket_compat.py` (new): runtime patch for the `genarate_salt()` bug.
+- `src/loxmqttrelay/loxwebsocket_compat.py` (new): runtime patches for the `genarate_salt()` bug
+  and the reconnect-loop `ClientSession` leak.
 - `src/loxmqttrelay/topic_sequencer.py` (new): `TopicSequencer` - per-topic send serialization with
   optional coalescing, applied to both HTTP and WebSocket at the `send_to_miniserver()` entry point.
 - `src/loxmqttrelay/http_miniserver_handler.py`: `send_to_minisever_via_websocket()` rewritten to
@@ -369,8 +461,12 @@ tapped switch, a short automation, a dimmer slide) would even arrive in the righ
   ordering bug's exact repro scenario.
 
 ### Test Plan
-- [x] `pytest` (198 existing + 24 new tests, 222 total) passes, run inside the Docker build image;
+- [x] `pytest` (198 existing + 29 new tests, 227 total) passes, run inside the Docker build image;
       timing-sensitive new tests additionally run 5x in a row to check for flakiness.
+- [x] `test_close_stale_session_and_call_*` (4 tests) / `test_async_init_patch_is_installed_and_idempotent`:
+      confirms the reconnect session-leak fix closes a stale open session before reconnecting,
+      leaves an already-closed one alone, handles the very first connect, still proceeds if closing
+      fails, and installs on `LoxWs` idempotently.
 - [x] `test_websocket_send_succeeds_on_first_ack` / `..._retries_after_timeout_then_succeeds` /
       `..._retries_on_non_200_code` / `..._gives_up_after_max_retries`: confirms the retry
       behavior end to end against a scripted fake client.
@@ -402,6 +498,11 @@ tapped switch, a short automation, a dimmer slide) would even arrive in the righ
   value that's already known to be stale before it even goes out is preferable to skipping it. Set
   it to `false` for the old "send everything" behavior if every intermediate value genuinely
   matters for some topic (e.g. accumulating counters rather than typical last-write-wins controls).
+- `_max_reconnect_attempts` was deliberately left unlimited (finding 7) - considered capping it so
+  a broken reconnect loop can't run "forever," but rejected: a long-running relay should keep trying
+  to recover from an outage of unknown duration, and the leak that made unlimited retries risky is
+  now fixed. Only raise this again if a *different* failure mode (not resource exhaustion) is found
+  that unlimited retries make worse.
 - This branch is independent of `fix/miniserver-http-session-reuse-and-basetopic-warning` and
   `feature/defensive-whitelist-sync` - all three are based on `main` and can be reviewed/merged in
   any order.
