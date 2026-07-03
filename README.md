@@ -322,6 +322,19 @@ The websocket implementation provides:
 - Automatic handling of connection issues
 - Support for both encrypted and unencrypted connections
 
+Each command sent over the websocket is confirmed against the Miniserver's actual response
+(correlated by topic) and retried with exponential backoff on a timeout or a non-success response,
+instead of being sent and forgotten:
+
+```toml
+[miniserver]
+miniserver_websocket_retry_attempts = 3          # total attempts, incl. the first
+miniserver_websocket_retry_backoff_seconds = 0.5 # doubles after each retry
+miniserver_websocket_ack_timeout_seconds = 5.0   # how long to wait for a response per attempt
+```
+
+Set `miniserver_websocket_retry_attempts = 1` to disable retrying.
+
 #### UDP Communication
 ```toml
 [udp]

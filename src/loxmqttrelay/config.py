@@ -44,6 +44,14 @@ class MiniserverConfig:
     miniserver_max_parallel_connections: int = 5
     sync_with_miniserver: bool = True
     use_websocket: bool = True
+    # WebSocket forwarding: send_websocket_command() alone does not wait for
+    # or check the Miniserver's response - these control how many attempts
+    # (incl. the first) we retry a command that times out or comes back with
+    # a non-200 Code, how long we wait for that response per attempt, and the
+    # base exponential backoff delay between attempts.
+    miniserver_websocket_retry_attempts: int = 3
+    miniserver_websocket_retry_backoff_seconds: float = 0.5
+    miniserver_websocket_ack_timeout_seconds: float = 5.0
 
 @dataclass
 class TopicsConfig:

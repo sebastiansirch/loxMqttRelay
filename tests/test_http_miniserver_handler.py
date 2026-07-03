@@ -2,11 +2,12 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
 from loxmqttrelay.http_miniserver_handler import HttpMiniserverHandler
-from loxmqttrelay.config import Config, AppConfig
+import loxmqttrelay.http_miniserver_handler as hmh_module
+from loxmqttrelay.config import Config, AppConfig, global_config
 from loxmqttrelay.compatible._loxmqttrelay import MiniserverDataProcessor
 import aiohttp
 import asyncio
-from typing import AsyncGenerator, Generator, List, Tuple, Any
+from typing import AsyncGenerator, Generator, List, Optional, Tuple, Any
 
 @pytest_asyncio.fixture
 async def mock_session() -> AsyncGenerator[MagicMock, None]:
@@ -321,7 +322,196 @@ async def test_standard_ports_behavior(
         normalized_topic = test_topic.replace('/', '_')
         
         await handler.send_to_miniserver_via_http(test_topic, normalized_topic, test_value)
-        
+
         # The current implementation might not include standard ports
         # This test documents the current behavior
         mock_session.return_value.__aenter__.return_value.get.assert_called()
+
+
+# WebSocket Send/Retry Tests
+
+class FakeWsClient:
+    """
+    A minimal stand-in for the loxwebsocket singleton: tracks sent commands,
+    lets a test script which responses (or no response, to simulate a
+    timeout) arrive for each successive send, and mimics
+    add_message_callback()'s dispatch shape (event_dict keyed by topic bytes,
+    matching what WebSocketAckWaiter expects).
+    """
+
+    def __init__(self, state: str = "CONNECTED"):
+        self.state = state
+        self.sent: List[Tuple[str, str]] = []
+        self.connect_calls = 0
+        self._callbacks: List = []
+        # One entry per send, in order. None = never respond (-> timeout).
+        # If there are more sends than entries, the last entry (or {"Code": "200"}
+        # if the list is empty) is reused.
+        self.responses: List[Optional[dict]] = []
+
+    def add_message_callback(self, callback, message_types=None) -> None:
+        self._callbacks.append(callback)
+
+    async def connect(self, user, password, loxone_url, receive_updates=False) -> None:
+        self.connect_calls += 1
+        self.state = "CONNECTED"
+
+    async def send_websocket_command(self, topic: str, value: str) -> None:
+        self.sent.append((topic, value))
+        idx = len(self.sent) - 1
+        if self.responses:
+            response = self.responses[idx] if idx < len(self.responses) else self.responses[-1]
+        else:
+            response = {"Code": "200"}
+        if response is not None:
+            asyncio.create_task(self._deliver(topic, response))
+
+    async def _deliver(self, topic: str, ll: dict) -> None:
+        await asyncio.sleep(0.005)
+        event_dict = {topic.encode(): ll}
+        for callback in list(self._callbacks):
+            await callback(event_dict, 0)
+
+
+@pytest.fixture
+def fast_ws_retry_settings() -> Generator[None, None, None]:
+    """Speed up retry/backoff/timeout so websocket retry tests run fast."""
+    ms = global_config.miniserver
+    original = (
+        ms.miniserver_websocket_retry_attempts,
+        ms.miniserver_websocket_retry_backoff_seconds,
+        ms.miniserver_websocket_ack_timeout_seconds,
+    )
+    ms.miniserver_websocket_retry_attempts = 3
+    ms.miniserver_websocket_retry_backoff_seconds = 0.01
+    ms.miniserver_websocket_ack_timeout_seconds = 0.05
+    yield
+    (
+        ms.miniserver_websocket_retry_attempts,
+        ms.miniserver_websocket_retry_backoff_seconds,
+        ms.miniserver_websocket_ack_timeout_seconds,
+    ) = original
+
+
+@pytest.mark.asyncio
+async def test_websocket_send_succeeds_on_first_ack(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    fake_ws = FakeWsClient()
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        await handler.send_to_minisever_via_websocket("t/opic", "t_opic", "42")
+
+    assert fake_ws.sent == [("t_opic", "42")]
+    assert fake_ws.connect_calls == 0  # already connected, no reconnect needed
+
+
+@pytest.mark.asyncio
+async def test_websocket_retries_after_timeout_then_succeeds(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    fake_ws = FakeWsClient()
+    fake_ws.responses = [None, {"Code": "200"}]  # 1st attempt times out, 2nd succeeds
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        await handler.send_to_minisever_via_websocket("t", "t", "1")
+
+    assert len(fake_ws.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_websocket_retries_on_non_200_code(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    fake_ws = FakeWsClient()
+    fake_ws.responses = [{"Code": "500"}, {"Code": "200"}]
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        await handler.send_to_minisever_via_websocket("t", "t", "1")
+
+    assert len(fake_ws.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_websocket_gives_up_after_max_retries(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    fake_ws = FakeWsClient()
+    fake_ws.responses = [None, None, None]  # never responds
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        await handler.send_to_minisever_via_websocket("t", "t", "1")
+
+    assert len(fake_ws.sent) == global_config.miniserver.miniserver_websocket_retry_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_websocket_waits_for_ongoing_reconnect_instead_of_reconnecting_again(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    """
+    While loxwebsocket's own reconnect() loop is already active (state ==
+    "RECONNECTING"), we must not call connect() ourselves - that would start
+    a second, concurrent handshake against the same instance. We should just
+    wait for the state to become CONNECTED.
+    """
+    fake_ws = FakeWsClient(state="RECONNECTING")
+
+    async def flip_to_connected() -> None:
+        await asyncio.sleep(0.02)
+        fake_ws.state = "CONNECTED"
+
+    asyncio.create_task(flip_to_connected())
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        await handler.send_to_minisever_via_websocket("t", "t", "1")
+
+    assert fake_ws.connect_calls == 0
+    assert len(fake_ws.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_connects_when_closed(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    fake_ws = FakeWsClient(state="CLOSED")
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        await handler.send_to_minisever_via_websocket("t", "t", "1")
+
+    assert fake_ws.connect_calls == 1
+    assert len(fake_ws.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_writes_are_serialized_under_concurrent_load(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None
+) -> None:
+    """
+    Load-style regression test: fire many concurrent forwards at once, as
+    happens when a burst of MQTT messages arrives, and verify the write lock
+    actually prevents overlapping send_websocket_command() calls. aiohttp
+    does not guarantee safety for concurrent writes on one shared websocket,
+    so any overlap here would mean a real risk of interleaved/corrupted
+    frames in production.
+    """
+    concurrency = {"current": 0, "max": 0}
+
+    class ConcurrencyTrackingWsClient(FakeWsClient):
+        async def send_websocket_command(self, topic: str, value: str) -> None:
+            concurrency["current"] += 1
+            concurrency["max"] = max(concurrency["max"], concurrency["current"])
+            await asyncio.sleep(0.005)  # simulate the write taking measurable time
+            concurrency["current"] -= 1
+            self.sent.append((topic, value))
+            asyncio.create_task(self._deliver(topic, {"Code": "200"}))
+
+    fake_ws = ConcurrencyTrackingWsClient()
+
+    with patch.object(hmh_module, "loxwebsocket", fake_ws):
+        await asyncio.gather(*[
+            handler.send_to_minisever_via_websocket(f"topic{i}", f"topic{i}", i)
+            for i in range(50)
+        ])
+
+    assert concurrency["max"] == 1
+    assert len(fake_ws.sent) == 50

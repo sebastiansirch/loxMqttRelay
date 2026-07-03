@@ -20,6 +20,13 @@ miniserver_pass = ""
 miniserver_max_parallel_connections = 5
 sync_with_miniserver = false
 use_websocket = true
+# WebSocket forwarding: attempts (incl. the first) before a command that
+# timed out or came back with a non-200 Code is given up on, how long (in
+# seconds) to wait for the Miniserver's response per attempt, and the base
+# delay in seconds for the exponential backoff between attempts.
+miniserver_websocket_retry_attempts = 3
+miniserver_websocket_retry_backoff_seconds = 0.5
+miniserver_websocket_ack_timeout_seconds = 5.0
 
 [topics]
 subscriptions = ["topic3"]
