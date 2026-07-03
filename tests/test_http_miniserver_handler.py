@@ -16,6 +16,10 @@ async def mock_session() -> AsyncGenerator[MagicMock, None]:
     with patch("aiohttp.ClientSession") as mock_client_session:
         # Create a MagicMock as "session object"
         mock_session_instance = MagicMock()
+        # A real ClientSession.closed is False until closed; an unconfigured
+        # MagicMock attribute is truthy, which would make session-reuse checks
+        # (`if session is None or session.closed`) think it's always closed.
+        mock_session_instance.closed = False
 
         # Simulate context manager
         mock_session_instance.__aenter__.return_value = mock_session_instance
@@ -147,6 +151,25 @@ async def test_http_value_conversion(
     assert f"http://{handler.target_ip}/dev/sps/io/topic1/123" in urls[0]
     assert f"http://{handler.target_ip}/dev/sps/io/topic2/True" in urls[1]
     assert f"http://{handler.target_ip}/dev/sps/io/topic3/45.67" in urls[2]
+
+@pytest.mark.asyncio
+async def test_http_session_reused_across_calls(
+    mock_session: MagicMock,
+    handler: HttpMiniserverHandler,
+    test_data: List[Tuple[str, Any]]
+) -> None:
+    """
+    A fresh aiohttp.ClientSession (i.e. a fresh TCP connection) must NOT be
+    opened for every message - that exhausts local ephemeral ports under
+    load. The handler should create the session once and reuse it.
+    """
+    for topic, value in test_data:
+        normalized_topic = topic.replace('/', '_')
+        await handler.send_to_miniserver_via_http(topic, normalized_topic, value)
+
+    assert mock_session.call_count == 1
+    assert mock_session.return_value.get.call_count == len(test_data)
+
 
 @pytest.mark.asyncio
 async def test_http_parallel_connections(mock_session: MagicMock, handler: HttpMiniserverHandler) -> None:

@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 import logging
 import json
-from loxmqttrelay.main import MQTTRelay, TOPIC
+from loxmqttrelay.main import MQTTRelay, TOPIC, warn_on_base_topic_overlap
 from loxmqttrelay.config import (
     Config, AppConfig, GeneralConfig,
     TopicsConfig, MiniserverConfig, global_config
@@ -133,3 +133,25 @@ async def test_whitelist_sync_on_miniserver_startup(config_instance: Config, moc
 
             # Neue Whitelist sollte wieder "synced_topic1", "synced_topic2" enthalten
             assert global_config.topics.topic_whitelist == ["synced_topic1", "synced_topic2"]
+
+
+@pytest.mark.parametrize(
+    "subscription,base_topic,should_warn",
+    [
+        ("loadtest/cmd/#", "loadtest/", True),          # wildcard subscription inside base_topic namespace
+        ("loadtest/cmd/sensor1", "loadtest/", True),     # literal topic inside base_topic namespace
+        ("myrelay/", "myrelay/config", True),            # base_topic nested inside a broader subscription
+        ("device/#", "myrelay/", False),                 # disjoint namespaces (recommended setup)
+        ("test/topic3", "test_only/", False),
+    ],
+)
+def test_warn_on_base_topic_overlap(
+    mock_logger: MagicMock, subscription: str, base_topic: str, should_warn: bool
+) -> None:
+    """Subscriptions living inside the base_topic namespace get silently dropped
+    by the Rust dispatcher instead of forwarded - this should be flagged loudly."""
+    warn_on_base_topic_overlap([subscription], base_topic)
+
+    warn_msgs: List[str] = [args[0] for args, kwargs in mock_logger.warning.call_args_list]
+    matched = any(subscription in m and base_topic in m for m in warn_msgs)
+    assert matched == should_warn

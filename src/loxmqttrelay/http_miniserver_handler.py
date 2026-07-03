@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import Any 
+from typing import Any, Optional
 from loxmqttrelay.config import global_config
 from loxmqttrelay.logging_config import get_lazy_logger
 from loxwebsocket.lox_ws_api import loxwebsocket
@@ -36,6 +36,22 @@ class HttpMiniserverHandler:
     """Handler for processing and sending data to Miniserver via HTTP."""
     def __init__(self):
         logger.info("MQTT Miniserver Handler created")
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """
+        Lazily create one shared ClientSession and reuse it for every request.
+        Opening a fresh ClientSession (i.e. a fresh TCP connection) per message
+        exhausts local ephemeral ports under sustained load - aiohttp's own
+        keep-alive connection pool avoids that, and the semaphore below still
+        caps how many requests are in flight at once.
+        """
+        if self._session is None or self._session.closed:
+            async with self._session_lock:
+                if self._session is None or self._session.closed:
+                    self._session = aiohttp.ClientSession(auth=self.auth, timeout=self.timeout)
+        return self._session
 
     async def send_to_minisever_via_websocket(
         self,
@@ -78,42 +94,42 @@ class HttpMiniserverHandler:
         # Use mock miniserver IP only if both provided and enabled
         logger.debug(f"Using miniserver address: {self.target_ip} {'(mock)' if (self.mock_ms_ip and self.enable_mock_miniserver) else '(real)'}")
 
-        async with aiohttp.ClientSession(auth=self.auth, timeout=self.timeout) as session:
-            # Ensure value is converted to string
-            safe_value = str(value)
-            # Use pre-built HTTP base URL
-            url = f"{self.http_base_url}/dev/sps/io/{normalized_topic}/{safe_value}"
-            logger.debug(f"Sending to {url}")
-            
-            try:
-                # Use semaphore to limit concurrent connections
-                async with self.connection_semaphore:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            logger.warning(f"Miniserver returned {resp.status} for topic {topic} (URL: {url})")
-                        else:
-                            logger.debug(f"Sent {topic}={value} to Miniserver successfully.")
-                        return { 'code': resp.status }
-            except asyncio.TimeoutError:
-                error_msg = f" Error 408: Timeout while sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): request timed out after 10 seconds"
-                logger.error(error_msg)
-                return 
-            except asyncio.CancelledError:
-                error_msg = f"Error 499: Request for {topic} (as {normalized_topic})={value} was cancelled (URL: {url})"
-                logger.error(error_msg)
-                return 
-            except OSError as e:
-                error_msg = f"Error 503: Connection error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
-                logger.error(error_msg)
-                return 
-            except aiohttp.ClientError as e:
-                error_msg = f"Error 500: Client error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
-                logger.error(error_msg)
-                return 
-            except Exception as e:
-                error_msg = f"Error 500: Unexpected error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
-                logger.error(error_msg)
-                return 
+        session = await self._get_session()
+        # Ensure value is converted to string
+        safe_value = str(value)
+        # Use pre-built HTTP base URL
+        url = f"{self.http_base_url}/dev/sps/io/{normalized_topic}/{safe_value}"
+        logger.debug(f"Sending to {url}")
+
+        try:
+            # Use semaphore to limit concurrent connections
+            async with self.connection_semaphore:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Miniserver returned {resp.status} for topic {topic} (URL: {url})")
+                    else:
+                        logger.debug(f"Sent {topic}={value} to Miniserver successfully.")
+                    return { 'code': resp.status }
+        except asyncio.TimeoutError:
+            error_msg = f" Error 408: Timeout while sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): request timed out after 10 seconds"
+            logger.error(error_msg)
+            return
+        except asyncio.CancelledError:
+            error_msg = f"Error 499: Request for {topic} (as {normalized_topic})={value} was cancelled (URL: {url})"
+            logger.error(error_msg)
+            return
+        except OSError as e:
+            error_msg = f"Error 503: Connection error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
+            logger.error(error_msg)
+            return
+        except aiohttp.ClientError as e:
+            error_msg = f"Error 500: Client error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
+            logger.error(error_msg)
+            return
+        except Exception as e:
+            error_msg = f"Error 500: Unexpected error sending {topic} (as {normalized_topic})={value} to Miniserver (URL: {url}): {str(e)}"
+            logger.error(error_msg)
+            return
     
     async def send_to_miniserver(
         self,

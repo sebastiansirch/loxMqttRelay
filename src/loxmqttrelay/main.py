@@ -2,6 +2,7 @@ import asyncio
 import types
 import sys
 import os
+from typing import List
 import orjson
 import uvloop
 
@@ -28,6 +29,31 @@ TOPIC = types.SimpleNamespace(
 )
 
 logger = get_lazy_logger(__name__)
+
+
+def _subscription_overlaps_base_topic(subscription: str, base_topic: str) -> bool:
+    """
+    The Rust message dispatcher (handle_mqtt_message) treats any received topic
+    starting with base_topic as a reserved control message (config/set,
+    config/get, ...); anything else in that namespace is silently dropped
+    instead of forwarded. This checks whether a subscription's fixed (non-
+    wildcard) prefix falls into that reserved namespace, or vice versa.
+    """
+    fixed_prefix = subscription.split("#", 1)[0].split("+", 1)[0]
+    return fixed_prefix.startswith(base_topic) or base_topic.startswith(fixed_prefix)
+
+
+def warn_on_base_topic_overlap(subscriptions: List[str], base_topic: str) -> None:
+    for subscription in subscriptions:
+        if _subscription_overlaps_base_topic(subscription, base_topic):
+            logger.warning(
+                f"Subscription '{subscription}' overlaps with base_topic '{base_topic}': "
+                "messages received on it that are not one of the reserved control topics "
+                "(config/set, config/add, config/remove, config/update, config/restart, "
+                "config/get, miniserverevent/startup) will be silently dropped instead of "
+                "forwarded to the Miniserver. Use a base_topic that is not a prefix of (and "
+                "not prefixed by) your data topics."
+            )
 
 # Initialize Rust logger (native call — log a breadcrumb so a hard crash here
 # is preceded by a traceable log line).
@@ -73,6 +99,8 @@ class MQTTRelay:
 
     async def connect_and_subscribe_mqtt(self):
         """Ensure MQTT client is connected with all required subscriptions."""
+        warn_on_base_topic_overlap(global_config.topics.subscriptions, global_config.general.base_topic)
+
         # Subscribe to configuration topics and miniserver startup event
         all_topics = global_config.topics.subscriptions + [
             TOPIC.CONFIG_SET,
