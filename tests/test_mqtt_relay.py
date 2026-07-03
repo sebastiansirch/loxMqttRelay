@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock
+import contextlib
 import logging
 import json
 from loxmqttrelay.main import MQTTRelay, TOPIC
@@ -47,12 +48,12 @@ def mock_logger() -> typing.Generator[MagicMock, None, None]:
 
 @pytest.mark.asyncio
 async def test_whitelist_loading_sequence(config_instance: Config, mock_logger: MagicMock) -> None:
-    """Test: Whitelist wird zuerst aus Config geladen, dann vom Miniserver überschrieben."""
+    """Test: Defensive (default) sync ADDS synced topics to the existing whitelist."""
     with patch.object(config_instance, '_load_config', return_value=None):
         relay = MQTTRelay()
         with patch('loxmqttrelay.main.sync_miniserver_whitelist') as mock_sync:
             mock_sync.return_value = ["synced_topic1", "synced_topic2"]
-            
+
             await relay.handle_miniserver_sync()
 
             # Logger-Infos einsammeln
@@ -61,8 +62,26 @@ async def test_whitelist_loading_sequence(config_instance: Config, mock_logger: 
             # Test 1: Erfolgreiches Sync-Log?
             assert any("Whitelist updated from miniserver configuration" in m for m in info_msgs)
 
-            # Test 2: Finale Whitelist?
-            assert global_config.topics.topic_whitelist == ["synced_topic1", "synced_topic2"]
+            # Test 2: Finale Whitelist enthält alte UND neue Topics (defensive merge)
+            assert set(global_config.topics.topic_whitelist) == {
+                "initial_topic1", "initial_topic2", "synced_topic1", "synced_topic2"
+            }
+
+@pytest.mark.asyncio
+async def test_whitelist_loading_sequence_non_defensive_replaces(
+    config_instance: Config, mock_logger: MagicMock
+) -> None:
+    """Test: With whitelist_sync_defensive=False, a sync fully replaces the whitelist (legacy behavior)."""
+    config_instance._config.miniserver.whitelist_sync_defensive = False
+
+    with patch.object(config_instance, '_load_config', return_value=None):
+        relay = MQTTRelay()
+        with patch('loxmqttrelay.main.sync_miniserver_whitelist') as mock_sync:
+            mock_sync.return_value = ["synced_topic1", "synced_topic2"]
+
+            await relay.handle_miniserver_sync()
+
+            assert set(global_config.topics.topic_whitelist) == {"synced_topic1", "synced_topic2"}
 
 @pytest.mark.asyncio
 async def test_whitelist_loading_with_sync_failure(config_instance: Config, mock_logger: MagicMock) -> None:
@@ -131,5 +150,53 @@ async def test_whitelist_sync_on_miniserver_startup(config_instance: Config, moc
             info_msgs: List[str] = [args[0] for args, kwargs in mock_logger.info.call_args_list]
             assert any("Miniserver startup detected, resyncing whitelist" in m for m in info_msgs)
 
-            # Neue Whitelist sollte wieder "synced_topic1", "synced_topic2" enthalten
-            assert global_config.topics.topic_whitelist == ["synced_topic1", "synced_topic2"]
+            # Whitelist enthält weiterhin "synced_topic1", "synced_topic2" (defensive merge)
+            assert {"synced_topic1", "synced_topic2"} <= set(global_config.topics.topic_whitelist)
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_disabled_by_default(config_instance: Config, mock_logger: MagicMock) -> None:
+    """Test: whitelist_sync_interval_seconds=0 (default) means periodic_miniserver_sync is a no-op."""
+    assert config_instance._config.miniserver.whitelist_sync_interval_seconds == 0
+
+    with patch.object(config_instance, '_load_config', return_value=None):
+        relay = MQTTRelay()
+        with patch('loxmqttrelay.main.sync_miniserver_whitelist') as mock_sync:
+            await relay.periodic_miniserver_sync()
+            mock_sync.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_runs_repeatedly(config_instance: Config, mock_logger: MagicMock) -> None:
+    """Test: a positive interval re-syncs on that cadence, not just once."""
+    config_instance._config.miniserver.whitelist_sync_interval_seconds = 0.01
+
+    with patch.object(config_instance, '_load_config', return_value=None):
+        relay = MQTTRelay()
+        with patch('loxmqttrelay.main.sync_miniserver_whitelist', return_value=["synced_topic1"]) as mock_sync:
+            task = asyncio.create_task(relay.periodic_miniserver_sync())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+            assert mock_sync.call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_warns_on_risky_combo(config_instance: Config, mock_logger: MagicMock) -> None:
+    """Test: periodic sync + non-defensive mode logs a warning about the risk of flapping loss."""
+    config_instance._config.miniserver.whitelist_sync_interval_seconds = 0.01
+    config_instance._config.miniserver.whitelist_sync_defensive = False
+
+    with patch.object(config_instance, '_load_config', return_value=None):
+        relay = MQTTRelay()
+        with patch('loxmqttrelay.main.sync_miniserver_whitelist', return_value=[]):
+            task = asyncio.create_task(relay.periodic_miniserver_sync())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+            warn_msgs = [args[0] for args, kwargs in mock_logger.warning.call_args_list]
+            assert any("whitelist_sync_defensive" in m for m in warn_msgs)

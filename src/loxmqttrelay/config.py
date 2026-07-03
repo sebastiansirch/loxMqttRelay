@@ -44,6 +44,19 @@ class MiniserverConfig:
     miniserver_max_parallel_connections: int = 5
     sync_with_miniserver: bool = True
     use_websocket: bool = True
+    # If True, a miniserver whitelist sync only ADDS newly discovered topics
+    # instead of replacing the whitelist outright. A sync that (transiently or
+    # due to a Miniserver-side race) returns an incomplete input list can then
+    # never silently drop a previously-known-good topic - the whitelist can
+    # only grow. The cost is a few extra forwarded topics the Miniserver
+    # rejects; the benefit is no more silent, permanent topic loss.
+    whitelist_sync_defensive: bool = True
+    # If > 0, re-run the miniserver whitelist sync automatically on this
+    # interval (in seconds), in addition to sync-on-startup and sync-on-
+    # "miniserverevent/startup". This means a Miniserver reboot that fails to
+    # publish (or whose publish is missed) no longer requires a relay restart
+    # to pick up whitelist changes. 0 disables periodic sync (default).
+    whitelist_sync_interval_seconds: int = 0
 
 @dataclass
 class TopicsConfig:

@@ -427,9 +427,42 @@ When enabled, the relay will:
 
 Caution: This function will assume that every Virtual Input is a possible target for forwarding mqtt messaages.
 
+#### Defensive whitelist sync
+
+There is no fixed pointer to the Miniserver's currently active configuration file, so a sync
+picks the newest-looking one it finds - which, in rare cases (e.g. the Miniserver is mid-reboot,
+or an old config archive with a later timestamp than the active one still exists), can be an
+incomplete or outdated snapshot. By default, a sync therefore only *adds* newly discovered topics
+to the whitelist instead of replacing it outright:
+
+```toml
+[miniserver]
+whitelist_sync_defensive = true  # default
+```
+
+A few extra whitelisted topics are harmless (the Miniserver simply rejects requests for inputs it
+doesn't have); silently and permanently dropping a topic that a later, incomplete sync happened
+not to see is not. Set `whitelist_sync_defensive = false` to restore the old behavior where each
+sync fully replaces the whitelist (e.g. if you rely on syncing to remove stale topics
+automatically).
+
 ### Trigger Manual Sync
 
 Configure your Miniserver to publish any message to `{base_topic}/miniserverevent/startup` on startup to trigger an automatic resync with the Miniserver configuration.
+
+### Periodic Sync
+
+Resyncing normally only happens on relay startup and when the Miniserver publishes to
+`{base_topic}/miniserverevent/startup` on its own reboot. If that message isn't configured on the
+Miniserver side (or gets missed, e.g. because the relay was briefly disconnected from the broker
+at that moment), the whitelist won't pick up Miniserver-side changes until the relay itself is
+restarted. To avoid depending on that event entirely, an interval-based resync can be enabled
+instead:
+
+```toml
+[miniserver]
+whitelist_sync_interval_seconds = 3600  # resync every hour; 0 disables (default)
+```
 
 ## Testing Setup
 

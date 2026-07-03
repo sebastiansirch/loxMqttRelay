@@ -42,29 +42,65 @@ class MQTTRelay:
         await self.connect_and_subscribe_mqtt()
         await self.handle_miniserver_sync()
         asyncio.create_task(start_udp_server())
+        asyncio.create_task(self.periodic_miniserver_sync())
 
         logger.info("MQTT Relay started")
         await asyncio.Future()
 
     async def handle_miniserver_sync(self):
-        """Attempt to sync whitelist with miniserver if enabled"""        
+        """Attempt to sync whitelist with miniserver if enabled"""
         if not global_config.miniserver.sync_with_miniserver:
             return
 
         # Store initial whitelist from config
         initial_whitelist = global_config.topics.topic_whitelist.copy()
+        defensive = global_config.miniserver.whitelist_sync_defensive
 
         try:
             inputs = await sync_miniserver_whitelist()
-            global_config.update_config(ConfigSection.TOPICS, {'topic_whitelist': inputs})
-            self.miniserver_data_processor.update_topic_whitelist(list(inputs))
-            logger.info("Whitelist updated from miniserver configuration")
+            # Defensive mode only ADDS topics discovered by this sync instead of
+            # replacing the whitelist outright, so a sync that (transiently, or
+            # due to a Miniserver-side race - see docs/) returns an incomplete
+            # list can never silently drop a previously-known-good topic.
+            list_mode = "add" if defensive else "set"
+            global_config.update_config(ConfigSection.TOPICS, {'topic_whitelist': inputs}, list_mode=list_mode)
+            merged_whitelist = list(global_config.topics.topic_whitelist)
+            self.miniserver_data_processor.update_topic_whitelist(merged_whitelist)
+            logger.info(
+                f"Whitelist updated from miniserver configuration "
+                f"(mode={list_mode}, {len(inputs)} synced, {len(merged_whitelist)} total)"
+            )
         except Exception as e:
             logger.error(f"Failed to sync with miniserver: {str(e)}")
             logger.info("Keeping whitelist from config")
             global_config.update_config(ConfigSection.TOPICS, {'topic_whitelist': initial_whitelist})
             self.miniserver_data_processor.update_topic_whitelist(list(initial_whitelist))
-    
+
+    async def periodic_miniserver_sync(self):
+        """
+        Re-run the miniserver whitelist sync on a fixed interval, if configured.
+        This means a Miniserver reboot that fails to publish
+        "miniserverevent/startup" (or whose publish is missed) no longer
+        requires a relay restart to pick up whitelist changes.
+        """
+        interval = global_config.miniserver.whitelist_sync_interval_seconds
+        if interval <= 0:
+            return
+
+        if not global_config.miniserver.whitelist_sync_defensive:
+            logger.warning(
+                "Periodic miniserver sync is enabled with whitelist_sync_defensive=False: "
+                "each periodic sync fully replaces the whitelist, so a transiently incomplete "
+                "sync can silently drop topics again on the next interval. Consider enabling "
+                "whitelist_sync_defensive."
+            )
+
+        logger.info(f"Periodic miniserver whitelist sync enabled every {interval}s")
+        while True:
+            await asyncio.sleep(interval)
+            logger.info("Periodic miniserver sync triggered")
+            await self.handle_miniserver_sync()
+
     # UPDATED: Synchronous wrapper with added logging to help testing
     def schedule_miniserver_sync(self):
         """Schedule the asynchronous handle_miniserver_sync in the event loop."""
