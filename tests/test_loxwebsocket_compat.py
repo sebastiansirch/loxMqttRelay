@@ -13,6 +13,7 @@ from loxmqttrelay.loxwebsocket_compat import (
     log_if_normal_closure,
     reset_token_if_not_already_reconnecting,
     log_raw_response_on_error,
+    reset_salt_state,
 )
 
 
@@ -256,6 +257,14 @@ def test_wrap_ws_send_str_handles_missing_ws_gracefully():
 
 
 def test_patch_websocket_write_serialization_is_installed_and_idempotent():
+    """
+    Note: like test_async_init_patch_is_installed_and_idempotent, LoxWs.async_init
+    is wrapped by more than one patch (this one, the stale-session-close
+    patch, and the salt-reset patch below all wrap it in turn), so only the
+    outermost wrapper's marker is visible on LoxWs.async_init directly.
+    Idempotency - no additional wrapping on repeated apply_patches() calls -
+    is what's actually verified here.
+    """
     apply_patches()
     patched_once = LoxWs.async_init
 
@@ -263,7 +272,6 @@ def test_patch_websocket_write_serialization_is_installed_and_idempotent():
     apply_patches()
 
     assert LoxWs.async_init is patched_once
-    assert getattr(LoxWs.async_init, "_loxmqttrelay_lock_patched", False) is True
 
 
 # --- clearer logging for close code 1000 ---
@@ -387,3 +395,103 @@ def test_patch_key_salt_response_logging_is_installed_and_idempotent():
 
     assert LxJsonKeySalt.read_user_salt_responce is patched_once
     assert getattr(LxJsonKeySalt.read_user_salt_responce, "_loxmqttrelay_patched", False) is True
+
+
+# --- reset the encryption handler's salt state on a fresh connection ---
+
+class _FakeEncryptionHandler:
+    def __init__(self, salt, used_count, time_stamp):
+        self._salt = salt
+        self._salt_used_count = used_count
+        self._salt_time_stamp = time_stamp
+
+
+def test_reset_salt_state_resets_all_three_fields():
+    handler = _FakeEncryptionHandler(salt="stale-salt-from-old-session", used_count=999, time_stamp=12345)
+
+    did_reset = reset_salt_state(handler)
+
+    assert did_reset is True
+    assert handler._salt == ""
+    assert handler._salt_used_count == 0
+    assert handler._salt_time_stamp == 0
+
+
+def test_reset_salt_state_handles_none_encryption_handler():
+    did_reset = reset_salt_state(None)
+
+    assert did_reset is False
+
+
+def test_patch_salt_reset_is_installed_and_idempotent():
+    apply_patches()
+    patched_once = LoxWs.async_init
+
+    apply_patches()
+    apply_patches()
+
+    assert LoxWs.async_init is patched_once
+
+
+@pytest.mark.asyncio
+async def test_reset_salt_state_makes_first_encrypt_use_fresh_salt_branch():
+    """
+    End-to-end check against the real (patched) LxEncryptionHandler.encrypt():
+    after reset_salt_state(), the first encrypted command must use the plain
+    "salt/..." format, not an invalid "nextSalt/..." continuation referencing
+    a salt from a session the Miniserver has already forgotten.
+    """
+    import urllib.parse
+    from base64 import b64decode
+
+    from Crypto.Cipher import AES
+    from Crypto.Util import Padding
+
+    handler = LxEncryptionHandler()
+    # Simulate leftover state from a previous, now-closed session: plenty of
+    # prior use and an old timestamp guarantee new_salt_needed() is True.
+    handler._salt = "stale-salt-from-old-session"
+    handler._salt_used_count = 999
+    handler._salt_time_stamp = 0
+
+    reset_salt_state(handler)
+
+    encrypted = await handler.encrypt("jdev/sys/getkey2/someuser")
+
+    encoded = encrypted.split("jdev/sys/enc/", 1)[1]
+    ciphertext = b64decode(urllib.parse.unquote(encoded))
+    cipher = AES.new(handler._key, AES.MODE_CBC, handler._iv)
+    plaintext = Padding.unpad(cipher.decrypt(ciphertext), 16).decode("utf-8")
+
+    assert plaintext.startswith("salt/")
+    assert "nextSalt" not in plaintext
+
+
+@pytest.mark.asyncio
+async def test_without_reset_a_reconnect_would_use_the_invalid_nextsalt_branch():
+    """
+    Control test proving the bug this patch fixes: WITHOUT the reset, a
+    handler carrying over state from a previous session takes the
+    "nextSalt/..." branch on its very next encrypt() call - the exact
+    condition that produced the Code 401 rejection in production.
+    """
+    handler = LxEncryptionHandler()
+    handler._salt = "stale-salt-from-old-session"
+    handler._salt_used_count = 999
+    handler._salt_time_stamp = 0
+
+    # no reset_salt_state() call here - simulating the unpatched behavior
+
+    import urllib.parse
+    from base64 import b64decode
+
+    from Crypto.Cipher import AES
+    from Crypto.Util import Padding
+
+    encrypted = await handler.encrypt("jdev/sys/getkey2/someuser")
+    encoded = encrypted.split("jdev/sys/enc/", 1)[1]
+    ciphertext = b64decode(urllib.parse.unquote(encoded))
+    cipher = AES.new(handler._key, AES.MODE_CBC, handler._iv)
+    plaintext = Padding.unpad(cipher.decrypt(ciphertext), 16).decode("utf-8")
+
+    assert plaintext.startswith("nextSalt/stale-salt-from-old-session/")

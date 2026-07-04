@@ -23,6 +23,7 @@ def apply_patches() -> None:
     _patch_salt_generation_return_value()
     _patch_async_init_closes_stale_session()
     _patch_websocket_writes_are_serialized()
+    _patch_encryption_handler_resets_salt_on_connect()
     _patch_normal_closure_logging()
     _patch_reconnect_resets_token()
     _patch_key_salt_response_logs_raw_on_error()
@@ -409,3 +410,91 @@ def log_raw_response_on_error(original_fn, instance, raw_response):
             exc_info=True,
         )
         raise
+
+
+def _patch_encryption_handler_resets_salt_on_connect() -> None:
+    """
+    LxEncryptionHandler (self._encryption_handler) is created once in
+    LoxWs.__init__() and never recreated or reset on reconnect - only
+    self._ws/self._session get torn down and rebuilt (stop()/async_init()).
+    Its salt-rotation state (self._salt, self._salt_used_count,
+    self._salt_time_stamp) therefore survives across reconnects untouched,
+    even though the Miniserver starts a completely fresh session on every
+    reconnect (a new RSA-wrapped key exchange, "ENCRYPTION READY").
+
+    encrypt()'s own logic:
+
+        if self._salt != "" and self.new_salt_needed():
+            prev_salt = self._salt
+            self._salt = self.genarate_salt()
+            s = "nextSalt/{}/{}/{}\0".format(prev_salt, self._salt, command)
+        else:
+            if self._salt == "":
+                self._salt = self.genarate_salt()
+            s = "salt/{}/{}\0".format(self._salt, command)
+
+    only takes the "fresh session" branch (plain "salt/...") when
+    self._salt == "". After any normal amount of prior traffic (more than
+    SALT_MAX_USE_COUNT=30 messages, or SALT_MAX_AGE_SECONDS=1h - both
+    virtually guaranteed to have already elapsed by the time a reconnect
+    happens), self._salt is left over from the old session and
+    new_salt_needed() is True, so the very FIRST encrypted command of a
+    brand new session - acquire_token()'s initial getkey2 request - takes
+    the "nextSalt/{prev_salt}/..." branch, referencing a salt value from a
+    session the Miniserver has no memory of (it just did a fresh key
+    exchange). A Miniserver enforcing salt-based replay protection has good
+    reason to reject that as suspicious - observed in production as a
+    `"Code": "401"` response to acquire_token()'s first request, immediately
+    after "ENCRYPTION READY" (see docs/ for the raw response and the
+    log_raw_response_on_error patch that surfaced it - credentials
+    themselves were confirmed correct and not locked out, ruling out an
+    actual auth problem).
+
+    This resets the salt-rotation state on self._encryption_handler right
+    before a fresh connection attempt, so the first command of every new
+    session correctly takes the "salt/{salt}/{command}" (fresh) branch
+    instead of an invalid "nextSalt" continuation from a session the
+    Miniserver has already forgotten. It does not touch the AES key/IV
+    (self._key/self._iv - also never regenerated across reconnects, but a
+    separate concern not addressed here) or any other part of the
+    encryption/auth flow.
+    """
+    try:
+        from loxwebsocket.lox_ws_api import LoxWs
+    except ImportError:
+        logger.warning(
+            "loxwebsocket.lox_ws_api.LoxWs not importable - "
+            "skipping the salt-reset-on-reconnect patch"
+        )
+        return
+
+    original_async_init = LoxWs.async_init
+
+    if getattr(original_async_init, "_loxmqttrelay_salt_reset_patched", False):
+        return
+
+    async def patched_async_init(self):
+        reset_salt_state(getattr(self, "_encryption_handler", None))
+        return await original_async_init(self)
+
+    patched_async_init._loxmqttrelay_salt_reset_patched = True
+    LoxWs.async_init = patched_async_init
+    logger.info("Applied loxwebsocket compat patch: reset salt state before a fresh connection")
+
+
+def reset_salt_state(encryption_handler) -> bool:
+    """
+    Resets `encryption_handler`'s salt-rotation bookkeeping
+    (_salt/_salt_used_count/_salt_time_stamp) to its just-constructed state,
+    so the next encrypt() call takes the "fresh session" branch instead of
+    an invalid "nextSalt" continuation. Returns True if a reset happened
+    (False if encryption_handler is None). Split out from the patch
+    installer so it can be unit tested directly against a fake or real
+    LxEncryptionHandler, without needing a real LoxWs or any network I/O.
+    """
+    if encryption_handler is None:
+        return False
+    encryption_handler._salt = ""
+    encryption_handler._salt_used_count = 0
+    encryption_handler._salt_time_stamp = 0
+    return True
