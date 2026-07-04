@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from loxwebsocket.encryption import LxEncryptionHandler
+from loxwebsocket.encryption import LxEncryptionHandler, LxJsonKeySalt
 from loxwebsocket.lox_ws_api import LoxWs
 from loxwebsocket.lxtoken import LxToken
 from loxmqttrelay.loxwebsocket_compat import (
@@ -12,6 +12,7 @@ from loxmqttrelay.loxwebsocket_compat import (
     wrap_ws_send_str_with_shared_lock,
     log_if_normal_closure,
     reset_token_if_not_already_reconnecting,
+    log_raw_response_on_error,
 )
 
 
@@ -336,3 +337,53 @@ def test_patch_reconnect_resets_token_is_installed_and_idempotent():
 
     assert LoxWs.reconnect is patched_once
     assert getattr(LoxWs.reconnect, "_loxmqttrelay_patched", False) is True
+
+
+# --- log the raw Miniserver response when parsing it fails ---
+
+def test_log_raw_response_on_error_returns_original_result_on_success():
+    def original_fn(instance, raw):
+        return f"parsed:{raw}"
+
+    result = log_raw_response_on_error(original_fn, object(), "some response")
+
+    assert result == "parsed:some response"
+
+
+def test_log_raw_response_on_error_logs_raw_response_and_reraises(caplog):
+    def original_fn(instance, raw):
+        raise TypeError("string indices must be integers, not 'str'")
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(TypeError, match="string indices"):
+            log_raw_response_on_error(original_fn, object(), '{"LL": "some error string"}')
+
+    assert any(
+        "some error string" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_read_user_salt_responce_logs_raw_response_on_malformed_ll(caplog):
+    """
+    End-to-end check against the real (patched) LxJsonKeySalt: an "LL" that's
+    a string instead of an object must log the raw response and still raise
+    a TypeError (unchanged from the unpatched behavior), not swallow it.
+    """
+    apply_patches()
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(TypeError):
+            LxJsonKeySalt().read_user_salt_responce('{"LL": "rejected"}')
+
+    assert any("rejected" in record.getMessage() for record in caplog.records)
+
+
+def test_patch_key_salt_response_logging_is_installed_and_idempotent():
+    apply_patches()
+    patched_once = LxJsonKeySalt.read_user_salt_responce
+
+    apply_patches()
+    apply_patches()
+
+    assert LxJsonKeySalt.read_user_salt_responce is patched_once
+    assert getattr(LxJsonKeySalt.read_user_salt_responce, "_loxmqttrelay_patched", False) is True

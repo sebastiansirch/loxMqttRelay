@@ -1,3 +1,6 @@
+import logging
+import re
+
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -5,6 +8,7 @@ from loxmqttrelay.http_miniserver_handler import HttpMiniserverHandler
 import loxmqttrelay.http_miniserver_handler as hmh_module
 from loxmqttrelay.config import Config, AppConfig, global_config
 from loxmqttrelay.compatible._loxmqttrelay import MiniserverDataProcessor
+from loxmqttrelay import logging_config as lazy_logging_config
 import aiohttp
 import asyncio
 from typing import AsyncGenerator, Generator, List, Optional, Tuple, Any
@@ -615,3 +619,104 @@ async def test_send_to_miniserver_without_coalescing_sends_every_value(
 
     values = [v for _, v in fake_ws.sent]
     assert values == ["30", "60", "90"]
+
+
+# Request-ID Logging Tests
+
+_REQUEST_ID_RE = re.compile(r"^\[([0-9a-f]{8})\]")
+
+
+@pytest.fixture
+def debug_logging() -> Generator[None, None, None]:
+    """
+    logger.debug(...) calls go through LazyLogger, which checks its own
+    module-level cached log level before ever reaching the real `logging`
+    module - independent of (and in addition to) caplog's own level
+    handling. Force it to DEBUG so debug-level request-ID lines are actually
+    captured, regardless of what LOG_LEVEL the test environment happens to
+    have configured.
+    """
+    original = lazy_logging_config._log_level
+    lazy_logging_config.set_log_level(logging.DEBUG)
+    yield
+    lazy_logging_config.set_log_level(original)
+
+
+def _extract_request_ids(records) -> List[str]:
+    ids = []
+    for record in records:
+        match = _REQUEST_ID_RE.match(record.getMessage())
+        if match:
+            ids.append(match.group(1))
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_send_to_miniserver_tags_every_retry_log_line_with_the_same_request_id(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None, debug_logging: None,
+    caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    One logical send that needs two attempts must produce log lines that all
+    carry the *same* request ID, so they can be isolated with a single grep
+    even while other topics are retrying concurrently in the same log.
+    """
+    fake_ws = FakeWsClient()
+    fake_ws.responses = [None, {"Code": "200"}]  # 1st attempt times out, 2nd succeeds
+
+    with caplog.at_level(logging.DEBUG, logger="loxmqttrelay.http_miniserver_handler"):
+        with patch.object(hmh_module, "loxwebsocket", fake_ws):
+            # send_to_miniserver() returns as soon as it's queued with the
+            # TopicSequencer, not once the (retried) send actually finishes -
+            # drain the topic to let the retry actually happen before asserting.
+            asyncio.create_task(handler.send_to_miniserver("light", "light", "on"))
+            await asyncio.sleep(0)  # let the task actually start before draining
+            await _drain(handler, "light")
+
+    ids = _extract_request_ids(caplog.records)
+    assert len(ids) >= 2  # at least the initial "Sending ..." line and the retry warning
+    assert len(set(ids)) == 1  # every tagged line shares the same request ID
+
+
+@pytest.mark.asyncio
+async def test_send_to_miniserver_uses_different_request_ids_for_different_sends(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None, debug_logging: None,
+    caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_ws = FakeWsClient()
+    fake_ws.responses = [{"Code": "200"}] * 5
+
+    with caplog.at_level(logging.DEBUG, logger="loxmqttrelay.http_miniserver_handler"):
+        with patch.object(hmh_module, "loxwebsocket", fake_ws):
+            await handler.send_to_miniserver("light", "light", "on")
+            await handler.send_to_miniserver("light", "light", "off")
+
+    ids = _extract_request_ids(caplog.records)
+    assert len(set(ids)) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_to_minisever_via_websocket_generates_a_request_id_when_called_directly(
+    handler: HttpMiniserverHandler, fast_ws_retry_settings: None, debug_logging: None,
+    caplog: pytest.LogCaptureFixture
+) -> None:
+    """Calling the protocol-specific method directly (as existing tests do) must not require a request_id."""
+    fake_ws = FakeWsClient()
+
+    with caplog.at_level(logging.DEBUG, logger="loxmqttrelay.http_miniserver_handler"):
+        with patch.object(hmh_module, "loxwebsocket", fake_ws):
+            await handler.send_to_minisever_via_websocket("light", "light", "on")
+
+    ids = _extract_request_ids(caplog.records)
+    assert len(ids) >= 1
+
+
+@pytest.mark.asyncio
+async def test_send_to_miniserver_via_http_honors_an_explicit_request_id(
+    mock_session: MagicMock, handler: HttpMiniserverHandler, debug_logging: None,
+    caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="loxmqttrelay.http_miniserver_handler"):
+        await handler.send_to_miniserver_via_http("test/topic", "test_topic", "value", request_id="deadbeef")
+
+    assert any(record.getMessage().startswith("[deadbeef]") for record in caplog.records)

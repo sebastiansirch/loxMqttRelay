@@ -25,6 +25,7 @@ def apply_patches() -> None:
     _patch_websocket_writes_are_serialized()
     _patch_normal_closure_logging()
     _patch_reconnect_resets_token()
+    _patch_key_salt_response_logs_raw_on_error()
     _patches_applied = True
 
 
@@ -340,3 +341,71 @@ def reset_token_if_not_already_reconnecting(instance, token_factory) -> bool:
         return False
     instance._token = token_factory()
     return True
+
+
+def _patch_key_salt_response_logs_raw_on_error() -> None:
+    """
+    LxJsonKeySalt.read_user_salt_responce() has no try/except at all:
+
+        def read_user_salt_responce(self, reponse):
+            js = json.loads(reponse)
+            value = js["LL"]["value"]     # <- crashes if js["LL"] isn't a dict
+            self.key = value["key"]
+            self.salt = value["salt"]
+
+    Observed in production as `reconnect() failed: string indices must be
+    integers, not 'str'` - meaning the Miniserver's response to
+    `jdev/sys/getkey2/<user>` (sent from acquire_token(), reached once the
+    reconnect-token-reset fix above routes a reconnect there directly) had
+    `"LL"` as a plain string rather than the expected object, and nothing
+    caught or logged what that string actually was before the exception
+    propagated, uncaught, all the way up to reconnect()'s generic handler.
+
+    A plain string LL is often how the Miniserver reports a rejected/failed
+    request (e.g. rate-limiting after repeated failed auth attempts, an
+    unrecognized user) rather than the request succeeding - but without the
+    raw text, there's no way to tell which from the log.
+
+    This wraps the method to log the raw response before re-raising the
+    same exception unchanged, so a future occurrence shows what the
+    Miniserver actually sent back instead of just the bare Python exception
+    message.
+    """
+    try:
+        from loxwebsocket.encryption import LxJsonKeySalt
+    except ImportError:
+        logger.warning(
+            "loxwebsocket.encryption.LxJsonKeySalt not importable - "
+            "skipping the key/salt-response logging patch"
+        )
+        return
+
+    original_read_user_salt_responce = LxJsonKeySalt.read_user_salt_responce
+
+    if getattr(original_read_user_salt_responce, "_loxmqttrelay_patched", False):
+        return
+
+    def patched_read_user_salt_responce(self, reponse):
+        return log_raw_response_on_error(original_read_user_salt_responce, self, reponse)
+
+    patched_read_user_salt_responce._loxmqttrelay_patched = True
+    LxJsonKeySalt.read_user_salt_responce = patched_read_user_salt_responce
+    logger.info("Applied loxwebsocket compat patch: log raw response on key/salt parse failure")
+
+
+def log_raw_response_on_error(original_fn, instance, raw_response):
+    """
+    Calls `original_fn(instance, raw_response)`; on any exception, logs
+    `raw_response` alongside it before re-raising the same exception
+    unchanged. Split out from the patch installer so it can be unit tested
+    directly against a fake original function, without needing a real
+    LxJsonKeySalt or any network I/O.
+    """
+    try:
+        return original_fn(instance, raw_response)
+    except Exception:
+        logger.error(
+            f"Failed to parse Miniserver response - raw response: {raw_response!r}",
+            exc_info=True,
+        )
+        raise
