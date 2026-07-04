@@ -368,13 +368,14 @@ once several attempts have failed:
 
 ```toml
 [miniserver]
-miniserver_websocket_reconnect_initial_delay_seconds = 1.0  # first attempt's wait
-miniserver_websocket_reconnect_backoff_multiplier = 2.0     # multiplied each subsequent attempt
+miniserver_websocket_reconnect_initial_delay_seconds = 1.0  # second attempt's wait
+miniserver_websocket_reconnect_backoff_multiplier = 2.0     # multiplied each further attempt
 ```
 
-With the defaults above, attempts wait 1s, 2s, 4s, 8s, then 15s (capped) for every attempt after
-that. Reconnect attempts themselves remain unlimited by design (this only changes how long each one
-waits before trying, not how many are attempted).
+The very first reconnect attempt is always immediate (0s) - right after a disconnect there's no
+reason to wait before even trying once. With the defaults above, every attempt after that waits 1s,
+2s, 4s, 8s, then 15s (capped) from then on. Reconnect attempts themselves remain unlimited by design
+(this only changes how long each one waits before trying, not how many are attempted).
 
 #### UDP Communication
 ```toml

@@ -292,13 +292,13 @@ def _patch_reconnect_uses_backoff_delay() -> None:
     stop(), the retry loop, http_ping()/async_init()/start() calls, the
     give-up/raise branch) but:
       - the fixed sleep is replaced by reconnect_backoff_delay(attempt): the
-        first attempt waits
-        miniserver_websocket_reconnect_initial_delay_seconds (default 1s),
-        each subsequent attempt's wait is multiplied by
+        very first attempt is always immediate (0s), the second attempt
+        waits miniserver_websocket_reconnect_initial_delay_seconds (default
+        1s), each further attempt's wait is multiplied by
         miniserver_websocket_reconnect_backoff_multiplier (default 2x),
         capped at loxwebsocket's own c.CONNECT_DELAY - so behavior converges
         back to identical-to-upstream once several attempts have failed
-        (default: 1s, 2s, 4s, 8s, 15s, 15s, ...);
+        (default: 0s, 1s, 2s, 4s, 8s, 15s, 15s, ...);
       - the token reset from the reconnect-token-reset fix (self._token, not
         the unused self.token) is folded in directly via
         reset_token_if_not_already_reconnecting(), superseding the
@@ -381,20 +381,26 @@ async def run_reconnect_with_backoff(instance) -> None:
 def reconnect_backoff_delay(attempt: int) -> float:
     """
     Returns the wait (seconds) before reconnect attempt number `attempt`
-    (1-based): starts at
+    (1-based). The very first attempt is always immediate (0s) - right after
+    a disconnect there's no reason to wait before even trying once. From the
+    second attempt on, the backoff schedule kicks in: starts at
     miniserver.miniserver_websocket_reconnect_initial_delay_seconds,
     multiplies by miniserver.miniserver_websocket_reconnect_backoff_multiplier
     each further attempt, capped at loxwebsocket's own c.CONNECT_DELAY so
     behavior converges back to the library's original fixed delay once
-    enough attempts have failed. Split out from the patch installer so it
-    can be unit tested directly, without needing a real LoxWs.
+    enough attempts have failed (default: 0s, 1s, 2s, 4s, 8s, 15s, 15s, ...).
+    Split out from the patch installer so it can be unit tested directly,
+    without needing a real LoxWs.
     """
     from loxwebsocket import const as loxwebsocket_const
+
+    if attempt <= 1:
+        return 0.0
 
     initial = global_config.miniserver.miniserver_websocket_reconnect_initial_delay_seconds
     multiplier = global_config.miniserver.miniserver_websocket_reconnect_backoff_multiplier
     cap = loxwebsocket_const.CONNECT_DELAY
-    return min(initial * (multiplier ** (attempt - 1)), cap)
+    return min(initial * (multiplier ** (attempt - 2)), cap)
 
 
 def reset_token_if_not_already_reconnecting(instance, token_factory) -> bool:

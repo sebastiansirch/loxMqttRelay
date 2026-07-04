@@ -343,13 +343,19 @@ def test_reset_token_if_not_already_reconnecting_skips_when_already_reconnecting
 
 # --- reconnect() waits with exponential backoff instead of a fixed delay ---
 
+def test_reconnect_backoff_delay_first_attempt_is_always_immediate():
+    """The very first reconnect attempt should never wait, regardless of config."""
+    assert reconnect_backoff_delay(1) == 0.0
+
+
 def test_reconnect_backoff_delay_follows_default_schedule_and_caps_at_connect_delay():
-    assert reconnect_backoff_delay(1) == 1.0
-    assert reconnect_backoff_delay(2) == 2.0
-    assert reconnect_backoff_delay(3) == 4.0
-    assert reconnect_backoff_delay(4) == 8.0
-    assert reconnect_backoff_delay(5) == loxwebsocket_const.CONNECT_DELAY
+    assert reconnect_backoff_delay(1) == 0.0
+    assert reconnect_backoff_delay(2) == 1.0
+    assert reconnect_backoff_delay(3) == 2.0
+    assert reconnect_backoff_delay(4) == 4.0
+    assert reconnect_backoff_delay(5) == 8.0
     assert reconnect_backoff_delay(6) == loxwebsocket_const.CONNECT_DELAY
+    assert reconnect_backoff_delay(7) == loxwebsocket_const.CONNECT_DELAY
 
 
 def test_reconnect_backoff_delay_respects_custom_config(monkeypatch):
@@ -360,9 +366,10 @@ def test_reconnect_backoff_delay_respects_custom_config(monkeypatch):
         global_config.miniserver, "miniserver_websocket_reconnect_backoff_multiplier", 3.0
     )
 
-    assert reconnect_backoff_delay(1) == pytest.approx(0.1)
-    assert reconnect_backoff_delay(2) == pytest.approx(0.3)
-    assert reconnect_backoff_delay(3) == pytest.approx(0.9)
+    assert reconnect_backoff_delay(1) == 0.0
+    assert reconnect_backoff_delay(2) == pytest.approx(0.1)
+    assert reconnect_backoff_delay(3) == pytest.approx(0.3)
+    assert reconnect_backoff_delay(4) == pytest.approx(0.9)
 
 
 class _FakeReconnectingLoxWs:
@@ -406,16 +413,17 @@ async def test_run_reconnect_with_backoff_succeeds_and_resets_token(monkeypatch)
     assert instance._token is not stale_token
     assert instance._token.token == ""
     assert instance.start_called is True
-    assert delays == [global_config.miniserver.miniserver_websocket_reconnect_initial_delay_seconds]
+    assert delays == [0.0]
 
 
 @pytest.mark.asyncio
 async def test_run_reconnect_with_backoff_uses_increasing_delays_capped_at_connect_delay(monkeypatch):
     """
-    First 2 attempts fail http_ping, next 2 fail async_init, 5th succeeds -
-    confirms the wait grows exponentially per attempt (1s, 2s, 4s, 8s) and
-    caps at loxwebsocket's own CONNECT_DELAY (15s) on the 5th, matching
-    what the fixed-delay behavior would have been from then on.
+    First 3 attempts fail http_ping, next 2 fail async_init, 6th succeeds -
+    confirms the first attempt is immediate, the wait then grows
+    exponentially (1s, 2s, 4s, 8s), and caps at loxwebsocket's own
+    CONNECT_DELAY (15s) on the 6th, matching what the fixed-delay behavior
+    would have been from then on.
     """
     delays = []
 
@@ -426,13 +434,13 @@ async def test_run_reconnect_with_backoff_uses_increasing_delays_capped_at_conne
 
     instance = _FakeReconnectingLoxWs(
         max_reconnect_attempts=0,
-        ping_results=[False, False, True, True, True],
+        ping_results=[False, False, False, True, True, True],
         async_init_results=[False, False, True],
     )
 
     await run_reconnect_with_backoff(instance)
 
-    assert delays == [1.0, 2.0, 4.0, 8.0, 15.0]
+    assert delays == [0.0, 1.0, 2.0, 4.0, 8.0, 15.0]
     assert instance.start_called is True
 
 

@@ -54,11 +54,17 @@ give-up/raise branch), but the fixed sleep is replaced by `reconnect_backoff_del
 
 ```python
 def reconnect_backoff_delay(attempt: int) -> float:
+    if attempt <= 1:
+        return 0.0
     initial = global_config.miniserver.miniserver_websocket_reconnect_initial_delay_seconds
     multiplier = global_config.miniserver.miniserver_websocket_reconnect_backoff_multiplier
     cap = loxwebsocket_const.CONNECT_DELAY
-    return min(initial * (multiplier ** (attempt - 1)), cap)
+    return min(initial * (multiplier ** (attempt - 2)), cap)
 ```
+
+The very first reconnect attempt is always immediate (0s, follow-up refinement - see
+below) - right after a disconnect there's no reason to wait before even trying once. From
+the second attempt on, the exponential schedule kicks in.
 
 New config (`MiniserverConfig`, defaults shown):
 
@@ -68,10 +74,21 @@ miniserver_websocket_reconnect_initial_delay_seconds = 1.0
 miniserver_websocket_reconnect_backoff_multiplier = 2.0
 ```
 
-With these defaults, attempts wait 1s, 2s, 4s, 8s, then 15s (capped at loxwebsocket's own
-`CONNECT_DELAY`) for every attempt after that - converging back to identical-to-upstream
-behavior once several attempts have failed, so a genuinely long outage doesn't end up
-hammering the Miniserver every second indefinitely.
+With these defaults, the first attempt is immediate, then subsequent attempts wait 1s,
+2s, 4s, 8s, then 15s (capped at loxwebsocket's own `CONNECT_DELAY`) from then on -
+converging back to identical-to-upstream behavior once several attempts have failed, so a
+genuinely long outage doesn't end up hammering the Miniserver every second indefinitely.
+
+### Follow-up: immediate first attempt
+
+Initial version of this fix still waited `miniserver_websocket_reconnect_initial_delay_seconds`
+(1s by default) before the *first* attempt too. Follow-up request: the first attempt
+should happen immediately, with the backoff schedule only kicking in from the second
+attempt on. `reconnect_backoff_delay()` now special-cases `attempt <= 1` to return `0.0`
+unconditionally (not configurable - there's no scenario where waiting before the very
+first try after a disconnect is useful), and the exponential formula for later attempts
+was shifted by one so the configured `initial_delay`/`multiplier` still describe the
+*first backoff step* (now the second attempt) exactly as before.
 
 `http_ping()`/`async_init()`/`start()` are still called as plain instance method calls, so
 every other patch on this class (stale-session-close, write-serialization, salt-reset)
@@ -83,22 +100,22 @@ implementation, this patch needs to be revisited to match.
 
 ## Testing
 
-- `reconnect_backoff_delay()`: follows the default schedule (1s, 2s, 4s, 8s) and caps at
-  `loxwebsocket`'s own `CONNECT_DELAY` from the 5th attempt on; respects custom config
-  values.
+- `reconnect_backoff_delay()`: the first attempt is always `0.0` regardless of config;
+  follows the default schedule (0s, 1s, 2s, 4s, 8s) and caps at `loxwebsocket`'s own
+  `CONNECT_DELAY` from the 6th attempt on; respects custom config values.
 - `run_reconnect_with_backoff()` (against a fake instance, `asyncio.sleep` mocked to
   record delays instead of actually waiting):
-  - succeeds on the first attempt, resets `_token`, calls `start()`.
-  - across a run that fails `http_ping()` twice then `async_init()` twice before
-    succeeding on the 5th attempt, the recorded delays are exactly `[1.0, 2.0, 4.0, 8.0,
-    15.0]`.
+  - succeeds on the first attempt (delay `0.0`), resets `_token`, calls `start()`.
+  - across a run that fails `http_ping()` three times then `async_init()` twice before
+    succeeding on the 6th attempt, the recorded delays are exactly `[0.0, 1.0, 2.0, 4.0,
+    8.0, 15.0]`.
   - already-`RECONNECTING` guard: returns immediately without calling `stop()`.
   - exhausting `max_reconnect_attempts` raises `LoxoneException` without ever calling
     `start()`.
 - `test_patch_reconnect_uses_backoff_delay_is_installed_and_idempotent`: the patch
   installs on `LoxWs.reconnect` and repeated `apply_patches()` calls don't wrap it again.
 
-All 257 tests pass (251 existing + 6 new), run inside the Docker build image. The two
+All 258 tests pass (257 existing + 1 new), run inside the Docker build image. The two
 most timing-sensitive test files (`test_http_miniserver_handler.py`,
 `test_loxwebsocket_compat.py`) re-run 5x with no failures.
 
@@ -110,10 +127,11 @@ most timing-sensitive test files (`test_http_miniserver_handler.py`,
 
 ### Summary
 - Replaced `loxwebsocket`'s fixed 15-second wait before every reconnect attempt with a
-  configurable exponential backoff (default: 1s, 2s, 4s, 8s, then capped at 15s), so
-  recovery from a brief connection blip starts almost immediately instead of always
-  waiting the full 15 seconds - while a genuinely long outage still backs off to the same
-  15s cadence as before, rather than retrying every second indefinitely.
+  configurable exponential backoff. The first attempt is now always immediate (0s);
+  every attempt after that follows the configured schedule (default: 1s, 2s, 4s, 8s, then
+  capped at 15s) - so recovery from a brief connection blip starts right away instead of
+  always waiting the full 15 seconds, while a genuinely long outage still backs off to
+  the same 15s cadence as before, rather than retrying every second indefinitely.
 - Folded the existing reconnect-token-reset fix into this change (same effect, one fewer
   wrapper), and fixed a cosmetic off-by-one in the reconnect attempt-number log line
   (`"attempt 2"` on the very first attempt) noticed while rewriting the method.
@@ -141,11 +159,13 @@ a sustained outage (converges back to the original fixed cadence).
   `reset_token_if_not_already_reconnecting()` helper are unchanged.
 
 ### Test Plan
-- [x] `pytest` (251 existing + 6 new tests, 257 total) passes, run inside the Docker build
+- [x] `pytest` (257 existing + 1 new test, 258 total) passes, run inside the Docker build
       image; the two most timing-sensitive test files re-run 5x for flakiness with no
       failures.
 - [x] `test_run_reconnect_with_backoff_uses_increasing_delays_capped_at_connect_delay`:
-      confirms the exact schedule (1s, 2s, 4s, 8s, 15s) across a multi-attempt run.
+      confirms the exact schedule (0s, 1s, 2s, 4s, 8s, 15s) across a multi-attempt run.
+- [x] `test_reconnect_backoff_delay_first_attempt_is_always_immediate`: confirms the first
+      attempt is `0.0` regardless of config.
 - [x] `test_run_reconnect_with_backoff_raises_after_exhausting_attempts`: confirms
       give-up/raise behavior is unchanged when `max_reconnect_attempts` is set and
       exhausted.
