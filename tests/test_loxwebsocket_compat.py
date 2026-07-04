@@ -19,6 +19,7 @@ from loxmqttrelay.loxwebsocket_compat import (
     reset_salt_state,
     reconnect_backoff_delay,
     run_reconnect_with_backoff,
+    cancel_background_tasks,
 )
 
 
@@ -377,6 +378,7 @@ class _FakeReconnectingLoxWs:
         self.state = "CONNECTED"
         self._max_reconnect_attempts = max_reconnect_attempts
         self._token = LxToken(token="stale-token-value")
+        self.background_tasks = set()
         self.stop_called = False
         self.start_called = False
         self._ping_results = iter(ping_results or [])
@@ -472,6 +474,73 @@ async def test_run_reconnect_with_backoff_raises_after_exhausting_attempts(monke
         await run_reconnect_with_backoff(instance)
 
     assert instance.start_called is False
+
+
+# --- stale background tasks from the dead connection are cancelled immediately ---
+
+class _FakeInstanceWithBackgroundTasks:
+    def __init__(self, background_tasks):
+        self.background_tasks = background_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_cancels_and_clears():
+    async def never_ending():
+        await asyncio.sleep(3600)
+
+    task_a = asyncio.create_task(never_ending())
+    task_b = asyncio.create_task(never_ending())
+    instance = _FakeInstanceWithBackgroundTasks(background_tasks={task_a, task_b})
+
+    cancelled_count = cancel_background_tasks(instance)
+    await asyncio.sleep(0)  # let the cancellation actually land
+
+    assert cancelled_count == 2
+    assert task_a.cancelled()
+    assert task_b.cancelled()
+    assert instance.background_tasks == set()
+
+
+def test_cancel_background_tasks_handles_empty_set():
+    instance = _FakeInstanceWithBackgroundTasks(background_tasks=set())
+
+    cancelled_count = cancel_background_tasks(instance)
+
+    assert cancelled_count == 0
+    assert instance.background_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_run_reconnect_with_backoff_cancels_stale_background_tasks():
+    """
+    Reproduces the production scenario: a keep_alive()-like task from the
+    just-dead connection is still in instance.background_tasks when a new
+    reconnect cycle starts. Without cancelling it immediately, it can survive
+    several failed attempts and later fail to write to the closed
+    transport, triggering a confusing duplicate "disconnected" log line and
+    a redundant reconnect() call - see loxwebsocket_compat.py's
+    cancel_background_tasks() docstring for the observed production case.
+
+    Deliberately does not mock asyncio.sleep here (unlike the other
+    run_reconnect_with_backoff tests): patching it globally would also
+    resolve the stale task's own asyncio.sleep(3600) instantly, letting it
+    run to completion instead of staying pending - the very thing this test
+    needs to still be pending when cancel_background_tasks() runs. The
+    first (and only, on success) real attempt delay is 0.0s here anyway, so
+    the test stays fast without any mocking.
+    """
+    async def stale_keep_alive():
+        await asyncio.sleep(3600)
+
+    stale_task = asyncio.create_task(stale_keep_alive())
+    instance = _FakeReconnectingLoxWs(max_reconnect_attempts=0, async_init_results=[True])
+    instance.background_tasks = {stale_task}
+
+    await run_reconnect_with_backoff(instance)
+    await asyncio.sleep(0)
+
+    assert stale_task.cancelled()
+    assert instance.background_tasks == set()
 
 
 def test_patch_reconnect_uses_backoff_delay_is_installed_and_idempotent():

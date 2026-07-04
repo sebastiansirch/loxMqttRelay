@@ -306,7 +306,25 @@ def _patch_reconnect_uses_backoff_delay() -> None:
       - the attempt-number log line's pre-existing off-by-one
         ("attempt {attempt + 1}" while attempt is already post-increment,
         so the very first attempt logs as "attempt 2") is fixed to log the
-        actual attempt number - purely cosmetic, no behavior change.
+        actual attempt number - purely cosmetic, no behavior change;
+      - self.background_tasks (ws_listen(), keep_alive(), refresh_token()
+        from the connection that just died) are cancelled immediately via
+        cancel_background_tasks(), right alongside stop() - upstream only
+        cancels them inside start(), which doesn't run until a NEW
+        async_init() has already succeeded. Confirmed in production logs: a
+        stale keep_alive() task can outlive several failed reconnect
+        attempts (observed surviving 3 attempts / ~6s of a Miniserver
+        returning 503 on the public-key endpoint), then fail to write to
+        the already-closed transport and call handle_connection_interrupt()
+        - which itself calls reconnect() again. Our own re-entrancy guard
+        (state == "RECONNECTING") makes that second call a no-op, so this
+        was never a functional failure - but it produced a confusing
+        duplicate "closed with code 1000" log line for the *same* earlier
+        disconnect, inflating apparent disconnect-frequency counts, and
+        left a real (if so far only circumstantially observed) window where
+        a stale task's own send_command() could race the new connection's
+        handshake (see docs/websocket-reliability.md's ack-correlation
+        note: send_command() has no request/response correlation at all).
 
     http_ping()/async_init()/start() are still called as plain instance
     method calls, so every other patch on this class (stale-session-close,
@@ -354,6 +372,7 @@ async def run_reconnect_with_backoff(instance) -> None:
     if instance.state == "RECONNECTING":
         return
     await instance.stop()
+    cancel_background_tasks(instance)
     reset_token_if_not_already_reconnecting(instance, LxToken)
     instance.state = "RECONNECTING"
     attempt = 0
@@ -376,6 +395,30 @@ async def run_reconnect_with_backoff(instance) -> None:
             logger.error("Reconnection failed: %s", e)
     logger.error("All reconnection attempts failed.")
     raise LoxoneException("All reconnection attempts failed.")
+
+
+def cancel_background_tasks(instance) -> int:
+    """
+    Cancels every task in `instance.background_tasks` (ws_listen(),
+    keep_alive(), refresh_token() - the three tasks LoxWs.start() creates
+    for the connection that just died) and clears the set, mirroring what
+    start() itself does before creating the next connection's tasks.
+    Calling this immediately on reconnect (rather than waiting for the next
+    successful start()) closes the window where a stale task can still be
+    running mid-reconnect: keep_alive() in particular sleeps for
+    KEEP_ALIVE_PERIOD (60s) between writes and doesn't check the connection
+    state until it wakes up, so it can survive several failed reconnect
+    attempts before trying to write to the already-closed transport.
+
+    Returns the number of tasks cancelled. Split out from
+    run_reconnect_with_backoff() so it can be unit tested directly against a
+    fake instance holding real asyncio tasks, without needing a real LoxWs.
+    """
+    tasks = list(instance.background_tasks)
+    for task in tasks:
+        task.cancel()
+    instance.background_tasks.clear()
+    return len(tasks)
 
 
 def reconnect_backoff_delay(attempt: int) -> float:
