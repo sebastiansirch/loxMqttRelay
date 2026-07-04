@@ -8,6 +8,7 @@ Import `apply_patches()` once, before any websocket traffic is sent.
 """
 import asyncio
 
+from loxmqttrelay.config import global_config
 from loxmqttrelay.logging_config import get_lazy_logger
 
 logger = get_lazy_logger(__name__)
@@ -25,7 +26,7 @@ def apply_patches() -> None:
     _patch_websocket_writes_are_serialized()
     _patch_encryption_handler_resets_salt_on_connect()
     _patch_normal_closure_logging()
-    _patch_reconnect_resets_token()
+    _patch_reconnect_uses_backoff_delay()
     _patch_key_salt_response_logs_raw_on_error()
     _patches_applied = True
 
@@ -274,60 +275,126 @@ def log_if_normal_closure(close_code) -> None:
         )
 
 
-def _patch_reconnect_resets_token() -> None:
+def _patch_reconnect_uses_backoff_delay() -> None:
     """
-    reconnect()'s intent is clearly to force a fresh token acquisition before
-    retrying - it does `self.token = LxToken()` right before the retry loop
-    starts. But every other place in the class (__init__, async_init(),
-    use_token(), hash_token(), acquire_token(), refresh_token()) reads or
-    writes `self._token` (with the underscore) - `self.token` is a distinct,
-    never-read attribute. reconnect()'s own reset is therefore a no-op:
-    self._token is never actually cleared, so every reconnect attempt keeps
-    trying to reuse whatever token was valid *before* the disconnect via
-    use_token(), even if the Miniserver has since invalidated it (e.g. after
-    its own reboot). That fails ("Error hasing token: Unexpected content..."),
-    falls back to acquire_token() - but the extra failed round-trip often
-    gives the Miniserver enough time to close the connection before
-    acquire_token() can finish, failing the whole attempt. Since self._token
-    is never cleared in between, this repeats identically, deterministically,
-    on every single reconnect attempt - the connection can never actually
-    come back up on its own.
+    LoxWs.reconnect()'s retry loop waits a fixed c.CONNECT_DELAY (15s,
+    loxwebsocket/const.py) before every single attempt, including the very
+    first one right after a disconnect - so recovery from even a brief blip
+    always takes at least 15s before the library so much as tries again.
+    Confirmed against production logs (see docs/) that reconnects do
+    otherwise succeed reliably - they're just always gated behind this fixed
+    wait.
 
-    This performs the reset reconnect() only *thinks* it's doing: sets
-    self._token (not self.token) to a fresh, empty LxToken() right before an
-    actual reconnect attempt starts, mirroring reconnect()'s own re-entrancy
-    guard (`if self.state == "RECONNECTING": return`) so an already-in-
-    progress reconnect isn't disrupted. With self._token empty,
-    async_init()'s own check (`self._token.token == ""`) takes it straight to
-    acquire_token() on the very next attempt, instead of first exhausting a
-    doomed use_token() call.
+    Since the wait is inline inside reconnect()'s own loop body (not behind
+    any separate, wrappable call), shortening it can't be done with a simple
+    before/after wrap like the other patches in this module - this replaces
+    reconnect() outright with a copy of the same orchestration (state guard,
+    stop(), the retry loop, http_ping()/async_init()/start() calls, the
+    give-up/raise branch) but:
+      - the fixed sleep is replaced by reconnect_backoff_delay(attempt): the
+        first attempt waits
+        miniserver_websocket_reconnect_initial_delay_seconds (default 1s),
+        each subsequent attempt's wait is multiplied by
+        miniserver_websocket_reconnect_backoff_multiplier (default 2x),
+        capped at loxwebsocket's own c.CONNECT_DELAY - so behavior converges
+        back to identical-to-upstream once several attempts have failed
+        (default: 1s, 2s, 4s, 8s, 15s, 15s, ...);
+      - the token reset from the reconnect-token-reset fix (self._token, not
+        the unused self.token) is folded in directly via
+        reset_token_if_not_already_reconnecting(), superseding the
+        standalone patch that used to wrap reconnect() for this alone;
+      - the attempt-number log line's pre-existing off-by-one
+        ("attempt {attempt + 1}" while attempt is already post-increment,
+        so the very first attempt logs as "attempt 2") is fixed to log the
+        actual attempt number - purely cosmetic, no behavior change.
 
-    This does not guarantee reconnection succeeds - if the underlying outage
-    has some other, independent cause, this alone won't fix it - but it
-    removes one concrete, deterministic, self-inflicted failure mode.
+    http_ping()/async_init()/start() are still called as plain instance
+    method calls, so every other patch on this class (stale-session-close,
+    write-serialization, salt-reset) keeps applying unchanged - only the
+    orchestration/timing of the retry loop itself is duplicated here, not
+    any protocol logic. If a future loxwebsocket release changes
+    reconnect()'s own implementation, this patch needs to be revisited to
+    match.
     """
     try:
         from loxwebsocket.lox_ws_api import LoxWs
-        from loxwebsocket.lxtoken import LxToken
     except ImportError:
         logger.warning(
-            "loxwebsocket.lox_ws_api.LoxWs/LxToken not importable - "
-            "skipping the reconnect-token-reset patch"
+            "loxwebsocket.lox_ws_api.LoxWs not importable - "
+            "skipping the reconnect-backoff-delay patch"
         )
         return
 
     original_reconnect = LoxWs.reconnect
 
-    if getattr(original_reconnect, "_loxmqttrelay_patched", False):
+    if getattr(original_reconnect, "_loxmqttrelay_backoff_patched", False):
         return
 
     async def patched_reconnect(self):
-        reset_token_if_not_already_reconnecting(self, LxToken)
-        return await original_reconnect(self)
+        return await run_reconnect_with_backoff(self)
 
-    patched_reconnect._loxmqttrelay_patched = True
+    patched_reconnect._loxmqttrelay_backoff_patched = True
     LoxWs.reconnect = patched_reconnect
-    logger.info("Applied loxwebsocket compat patch: reconnect() resets the actually-used token")
+    logger.info("Applied loxwebsocket compat patch: exponential backoff before reconnect attempts")
+
+
+async def run_reconnect_with_backoff(instance) -> None:
+    """
+    Reimplementation of LoxWs.reconnect()'s orchestration loop, using
+    reconnect_backoff_delay() instead of a fixed wait - see
+    _patch_reconnect_uses_backoff_delay() for the full rationale. Split out
+    from the patch installer so it can be unit tested directly against a
+    fake instance exposing state/_max_reconnect_attempts/_token plus async
+    stop()/http_ping()/async_init()/start() methods, without needing a real
+    LoxWs or any network I/O.
+    """
+    from loxwebsocket.lxtoken import LxToken
+    from loxwebsocket.exceptions import LoxoneException
+
+    if instance.state == "RECONNECTING":
+        return
+    await instance.stop()
+    reset_token_if_not_already_reconnecting(instance, LxToken)
+    instance.state = "RECONNECTING"
+    attempt = 0
+    while instance._max_reconnect_attempts == 0 or instance._max_reconnect_attempts > attempt:
+        attempt += 1
+        delay = reconnect_backoff_delay(attempt)
+        logger.info(f"Reconnect attempt {attempt} of {instance._max_reconnect_attempts}")
+        logger.info(f"Waiting for {delay} seconds before retrying...")
+        await asyncio.sleep(delay)
+        if not await instance.http_ping():
+            continue
+        try:
+            if await instance.async_init():
+                logger.debug("Reconnection successful.")
+                await instance.start()
+                return
+            else:
+                logger.debug("Reconnection failed.")
+        except Exception as e:
+            logger.error("Reconnection failed: %s", e)
+    logger.error("All reconnection attempts failed.")
+    raise LoxoneException("All reconnection attempts failed.")
+
+
+def reconnect_backoff_delay(attempt: int) -> float:
+    """
+    Returns the wait (seconds) before reconnect attempt number `attempt`
+    (1-based): starts at
+    miniserver.miniserver_websocket_reconnect_initial_delay_seconds,
+    multiplies by miniserver.miniserver_websocket_reconnect_backoff_multiplier
+    each further attempt, capped at loxwebsocket's own c.CONNECT_DELAY so
+    behavior converges back to the library's original fixed delay once
+    enough attempts have failed. Split out from the patch installer so it
+    can be unit tested directly, without needing a real LoxWs.
+    """
+    from loxwebsocket import const as loxwebsocket_const
+
+    initial = global_config.miniserver.miniserver_websocket_reconnect_initial_delay_seconds
+    multiplier = global_config.miniserver.miniserver_websocket_reconnect_backoff_multiplier
+    cap = loxwebsocket_const.CONNECT_DELAY
+    return min(initial * (multiplier ** (attempt - 1)), cap)
 
 
 def reset_token_if_not_already_reconnecting(instance, token_factory) -> bool:

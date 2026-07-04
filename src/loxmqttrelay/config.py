@@ -62,6 +62,18 @@ class MiniserverConfig:
     # order (false, higher latency under a burst on one topic, no value ever
     # dropped).
     miniserver_coalesce_topic_updates: bool = True
+    # loxwebsocket's own reconnect() waits a fixed 15s (its CONNECT_DELAY
+    # constant) before every single reconnect attempt, including the very
+    # first one after a disconnect. These control an exponential backoff
+    # instead: the first attempt waits
+    # miniserver_websocket_reconnect_initial_delay_seconds, each subsequent
+    # attempt's wait is multiplied by
+    # miniserver_websocket_reconnect_backoff_multiplier, capped at
+    # loxwebsocket's own CONNECT_DELAY so behavior converges back to
+    # identical-to-upstream after enough failed attempts (default: 1s, 2s,
+    # 4s, 8s, 15s, 15s, ...).
+    miniserver_websocket_reconnect_initial_delay_seconds: float = 1.0
+    miniserver_websocket_reconnect_backoff_multiplier: float = 2.0
 
 @dataclass
 class TopicsConfig:
