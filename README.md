@@ -322,6 +322,25 @@ The websocket implementation provides:
 - Automatic handling of connection issues
 - Support for both encrypted and unencrypted connections
 
+##### Reconnect Backoff
+
+`loxwebsocket`'s own reconnect loop waits a fixed 15 seconds before every single reconnect
+attempt, including the very first one right after a disconnect - so recovery from even a brief
+blip always takes at least 15 seconds. This replaces that fixed wait with an exponential backoff,
+capped at the library's own 15-second delay so behavior converges back to the original fixed delay
+once several attempts have failed:
+
+```toml
+[miniserver]
+miniserver_websocket_reconnect_initial_delay_seconds = 1.0  # second attempt's wait
+miniserver_websocket_reconnect_backoff_multiplier = 2.0     # multiplied each further attempt
+```
+
+The very first reconnect attempt is always immediate (0s) - right after a disconnect there's no
+reason to wait before even trying once. With the defaults above, every attempt after that waits 1s,
+2s, 4s, 8s, then 15s (capped) from then on. Reconnect attempts themselves remain unlimited by design
+(this only changes how long each one waits before trying, not how many are attempted).
+
 #### UDP Communication
 ```toml
 [udp]

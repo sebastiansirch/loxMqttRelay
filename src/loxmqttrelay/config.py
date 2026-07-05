@@ -44,6 +44,18 @@ class MiniserverConfig:
     miniserver_max_parallel_connections: int = 5
     sync_with_miniserver: bool = True
     use_websocket: bool = True
+    # loxwebsocket's own reconnect() waits a fixed 15s (its CONNECT_DELAY
+    # constant) before every single reconnect attempt, including the very
+    # first one after a disconnect. These control an exponential backoff
+    # instead: the very first attempt is always immediate, the second
+    # attempt waits miniserver_websocket_reconnect_initial_delay_seconds,
+    # each further attempt's wait is multiplied by
+    # miniserver_websocket_reconnect_backoff_multiplier, capped at
+    # loxwebsocket's own CONNECT_DELAY so behavior converges back to
+    # identical-to-upstream after enough failed attempts (default: 0s, 1s,
+    # 2s, 4s, 8s, 15s, 15s, ...).
+    miniserver_websocket_reconnect_initial_delay_seconds: float = 1.0
+    miniserver_websocket_reconnect_backoff_multiplier: float = 2.0
 
 @dataclass
 class TopicsConfig:

@@ -1,11 +1,16 @@
 import asyncio
 import aiohttp
-from typing import Any 
+from typing import Any
 from loxmqttrelay.config import global_config
 from loxmqttrelay.logging_config import get_lazy_logger
+from loxmqttrelay.loxwebsocket_compat import apply_patches as apply_loxwebsocket_patches
 from loxwebsocket.lox_ws_api import loxwebsocket
 
 logger = get_lazy_logger(__name__)
+
+# Must run before any websocket traffic is sent - see loxwebsocket_compat.py
+# for exactly what this fixes and why.
+apply_loxwebsocket_patches()
 
 # Initialize global instances with default values
 

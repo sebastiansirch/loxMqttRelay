@@ -20,6 +20,16 @@ miniserver_pass = ""
 miniserver_max_parallel_connections = 5
 sync_with_miniserver = false
 use_websocket = true
+# loxwebsocket's own reconnect() waits a fixed 15s before every reconnect
+# attempt, including the first one after a disconnect. This replaces that
+# with exponential backoff instead: the very first attempt is always
+# immediate, the second attempt waits
+# miniserver_websocket_reconnect_initial_delay_seconds, each further
+# attempt's wait is multiplied by
+# miniserver_websocket_reconnect_backoff_multiplier, capped at
+# loxwebsocket's own 15s delay (default: 0s, 1s, 2s, 4s, 8s, 15s, 15s, ...).
+miniserver_websocket_reconnect_initial_delay_seconds = 1.0
+miniserver_websocket_reconnect_backoff_multiplier = 2.0
 
 [topics]
 subscriptions = ["topic3"]
